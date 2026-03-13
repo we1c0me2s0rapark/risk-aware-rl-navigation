@@ -1,41 +1,66 @@
-# Prerequisites
-*.d
-
-# Compiled Object files
-*.slo
-*.lo
+# ==========================
+# Build / compiled files
+# ==========================
+# Object files
 *.o
 *.obj
+*.lo
+*.slo
 
-# Precompiled Headers
-*.gch
-*.pch
-
-# Linker files
-*.ilk
-
-# Debugger Files
-*.pdb
-
-# Compiled Dynamic libraries
+# Libraries
+*.a
+*.lib
+*.la
+*.lai
 *.so
 *.dylib
 *.dll
-
-# Fortran module files
-*.mod
-*.smod
-
-# Compiled Static libraries
-*.lai
-*.la
-*.a
-*.lib
 
 # Executables
 *.exe
 *.out
 *.app
 
-# debug information files
+# Debug / linker
+*.pdb
+*.ilk
 *.dwo
+
+# Precompiled headers
+*.gch
+*.pch
+
+# Fortran module files
+*.mod
+*.smod
+
+# ==========================
+# Python
+# ==========================
+# Virtual environment
+.venv/
+
+# Bytecode
+__pycache__/
+*.pyc
+
+# Jupyter Notebook checkpoints
+.ipynb_checkpoints/
+
+# ==========================
+# Project folders / logs
+# ==========================
+runs/
+logs/
+checkpoints/
+
+# ==========================
+# Documentation
+# ==========================
+Doxyfile
+html/
+
+# ==========================
+# Notes / temporary files
+# ==========================
+note*
