@@ -56,12 +56,12 @@ def attempt_connection(host: str, port: int, timeout: float) -> Optional[carla.W
         client = carla.Client(host, port)
         client.set_timeout(timeout)
         world = client.get_world()
-        print(f"Connected via {host}")
+        print(f"🚀 Connected via {host}")
         return world
     except RuntimeError as exc:
-        print(f"Connection via {host} failed: {exc}")
+        print(f"💥 Connection via {host} failed: {exc}")
     except Exception as exc:
-        print(f"Unexpected error via {host}: {exc}")
+        print(f"💥 Unexpected error via {host}: {exc}")
 
     return None
 
