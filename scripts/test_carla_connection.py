@@ -2,7 +2,6 @@ import carla
 import subprocess
 from typing import Optional, List
 
-
 def get_windows_host_ip() -> Optional[str]:
     """
     @brief Retrieve the Windows host IP address from WSL.
@@ -34,23 +33,24 @@ def get_windows_host_ip() -> Optional[str]:
 
     return None
 
-
 def attempt_connection(host: str, port: int, timeout: float) -> Optional[carla.World]:
     """
     @brief Attempt to connect to CARLA using a single host.
 
-    @param host
-        Host address to try.
+    Tries to establish a connection to CARLA at the given host and port.
+    Prints debug messages indicating success or failure.
 
+    @param host
+        Host address to attempt.
     @param port
         CARLA TCP port.
-
     @param timeout
         Connection timeout in seconds.
 
     @return Optional[carla.World]
         A CARLA world object if the connection succeeds, otherwise None.
     """
+
     try:
         print(f"Trying {host}...")
         client = carla.Client(host, port)
@@ -65,26 +65,24 @@ def attempt_connection(host: str, port: int, timeout: float) -> Optional[carla.W
 
     return None
 
-
-def connect_carla(port: int = 2000, timeout: float = 5.0) -> carla.World:
+def connect_carla(port: int = 2000, timeout: float = 5.0) -> Optional[carla.World]:
     """
     @brief Establish a connection to the CARLA simulator.
 
-    The function first tries localhost. If that fails, it tries a valid
-    Windows host IP extracted from /etc/resolv.conf, if available.
+    The function first attempts to connect to a valid Windows host IP 
+    (if available in WSL2), then falls back to localhost. If the 
+    connection succeeds, a carla.World object is returned. If all 
+    attempts fail, an error message is printed and None is returned.
 
     @param port
-        TCP port used by the CARLA simulator.
-
+        TCP port used by the CARLA simulator (default 2000).
     @param timeout
-        Connection timeout in seconds.
+        Connection timeout in seconds (default 5.0).
 
-    @return carla.World
-        The CARLA world object obtained from the simulator.
-
-    @throws RuntimeError
-        Raised when the simulator cannot be reached.
+    @return Optional[carla.World]
+        The CARLA world object if the connection succeeds, otherwise None.
     """
+
     hosts: List[str] = ["localhost"]
 
     windows_host_ip = get_windows_host_ip()
@@ -96,27 +94,25 @@ def connect_carla(port: int = 2000, timeout: float = 5.0) -> carla.World:
         world = attempt_connection(host, port, timeout)
         if world:
             return world
+
+    print(f"Could not connect to CARLA on hosts: {hosts}")
     return None
-
-    raise RuntimeError(
-        "Could not connect to CARLA. "
-        "Ensure that the simulator is running and listening on port 2000."
-    )
-
 
 def main() -> None:
     """
     @brief Run a basic CARLA connection test.
+
+    Attempts to connect to CARLA using connect_carla(). If successful,
+    prints connection confirmation, map name, and number of actors
+    in the world.
     """
+
     print("Connecting to CARLA...")
     world = connect_carla()
-    if world is None:
-        print("Failed to connect to CARLA.")
-        return
-    print("Connected successfully")
-    print(f"Map: {world.get_map().name}")
-    print(f"Actors in world: {len(world.get_actors())}")
-
+    if world:
+        print("Connected successfully")
+        print(f"Map: {world.get_map().name}")
+        print(f"Actors in world: {len(world.get_actors())}")
 
 if __name__ == "__main__":
     main()
