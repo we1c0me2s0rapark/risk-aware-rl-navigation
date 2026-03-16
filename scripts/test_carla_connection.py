@@ -19,9 +19,9 @@ def main() -> None:
 
     print("Connecting to CARLA...")
 
-    world = connect_carla()
+    client, world = connect_carla()
 
-    if world is not None:
+    if client is not None and world is not None:
         print_world_summary(world)
     else:
         print("Failed to connect to CARLA.")
