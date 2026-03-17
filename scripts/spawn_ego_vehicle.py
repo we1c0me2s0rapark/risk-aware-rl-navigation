@@ -21,10 +21,10 @@ def main() -> None:
         print("Failed to connect to CARLA.")
         return
 
-    # Initialise the manager with the current world instance.
+    # Initialise the manager with the current world instance
     vehicle_manager = VehicleManager(world)
     
-    # Attempt to spawn the default ego vehicle.
+    # Attempt to spawn the default ego vehicle
     ego_vehicle = vehicle_manager.spawn_ego_vehicle()
 
     if ego_vehicle is not None:
@@ -32,7 +32,7 @@ def main() -> None:
     else:
         print("Ego vehicle spawn failed.")
 
-    # Prevent immediate script termination to allow for visual verification.
+    # Prevent immediate script termination to allow for visual verification
     if vehicle_manager.spawned_vehicles:
         input("Press Enter to destroy vehicles and exit...")
         vehicle_manager.destroy_all()
