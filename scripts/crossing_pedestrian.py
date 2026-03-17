@@ -10,6 +10,7 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "s
 from carla_client.connection import connect_carla, configure_simulation
 from carla_client.vehicle_manager import VehicleManager
 from carla_client.pedestrian_manager import PedestrianManager
+from carla_client.spectator_manager import SpectatorManager
 from carla_client.utilities import is_q_pressed
 
 
@@ -41,11 +42,19 @@ def main() -> None:
         # Instantiate management components
         v_manager = VehicleManager(world)
         p_manager = PedestrianManager(world)
+        spec_manager = SpectatorManager(world)
+
+        if v_manager is None:
+            raise RuntimeError("💥 Failed to initialise VehicleManager.")
+        if p_manager is None:
+            raise RuntimeError("💥 Failed to initialise PedestrianManager.")
+        if spec_manager is None:
+            raise RuntimeError("💥 Failed to initialise SpectatorManager.")
 
         # Spawn ego vehicle
         ego_vehicle = v_manager.spawn_ego_vehicle()
         if ego_vehicle is None:
-            return
+            raise RuntimeError("💥 Failed to spawn ego vehicle.")
 
         # Apply handbrake to ensure the vehicle remains stationary during the test
         ego_vehicle.apply_control(carla.VehicleControl(hand_brake=True))
@@ -86,32 +95,10 @@ def main() -> None:
             # Update all pedestrian states and optionally render debug visuals
             p_manager.update_all(debug=world.debug)
             
-            if False:
-                # Overhead spectator view centered on the vehicle
-                spec_loc = v_transform.location + carla.Location(z=15)
-                world.get_spectator().set_transform(carla.Transform(spec_loc, carla.Rotation(pitch=-90)))
+            if True:
+                spec_manager.set_overhead_view(ego_vehicle)
             else:
-                # Third-person chase camera positioned relative to the vehicle
-                v_rot = v_transform.rotation
-                local_offset = carla.Location(x=-5, y=0, z=3) # 5m behind and 3m above the vehicle
-
-                rotation = carla.Rotation(yaw=v_rot.yaw)
-
-                # Transform local offset into world-space coordinates
-                rotated_offset = \
-                    rotation.get_forward_vector() * local_offset.x \
-                    + rotation.get_right_vector() * local_offset.y \
-                    + rotation.get_up_vector() * local_offset.z # convert the offset into global coordinates relative to the car's facing direction
-
-                spec_loc = v_transform.location + rotated_offset # apply the rotated offset to the vehicle's location to get the spectator's location
-
-                spec_transform = carla.Transform(
-                    spec_loc, 
-                    carla.Rotation(pitch=-15, yaw=v_rot.yaw, roll=0)
-                )
-
-                spectator = world.get_spectator()
-                spectator.set_transform(spec_transform)
+                spec_manager.set_chase_view(ego_vehicle)
 
             world.tick()
 

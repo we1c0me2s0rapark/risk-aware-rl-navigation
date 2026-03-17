@@ -1,6 +1,25 @@
 import carla
 import numpy as np
+from dataclasses import dataclass
 from typing import List, Optional
+
+@dataclass
+class VehicleState:
+    """
+    @brief Runtime state of a vehicle in the simulation.
+
+    @param actor The CARLA Vehicle actor.
+    @param target_waypoint Optional waypoint the vehicle is currently heading towards.
+    @param desired_speed Desired speed in m/s.
+    @param is_active Whether the vehicle is currently active/moving.
+    @param controller Optional AI or custom controller associated with the vehicle.
+    """
+    actor: carla.Vehicle
+    target_waypoint: Optional[carla.Waypoint] = None
+    wheelbase: Optional[float] = None
+    desired_speed: float = 0.0
+    is_active: bool = True
+    controller: Optional[carla.Actor] = None
 
 class VehicleManager:
     """
@@ -18,7 +37,49 @@ class VehicleManager:
         """
         self.world = world
         self.blueprint_library = world.get_blueprint_library()
-        self.spawned_vehicles: List[carla.Vehicle] = []
+        self.vehicles: List[VehicleState] = []
+
+    def spawn_ego_vehicle(
+        self,
+        vehicle_filter: str = "vehicle.tesla.model3",
+        spawn_index: int = 0
+    ) -> Optional[carla.Vehicle]:
+        """
+        @brief Spawn an ego vehicle in the CARLA world.
+
+        @param vehicle_filter Blueprint filter string for the desired model.
+        @param spawn_index The index of the map spawn point to utilise.
+        @return The spawned carla.Vehicle instance, or None if the operation fails.
+        """
+        spawn_points = self.world.get_map().get_spawn_points()
+        if not spawn_points:
+            print("No spawn points available in the current map.")
+            return None
+
+        if spawn_index >= len(spawn_points):
+            print(f"Spawn index {spawn_index} is out of range. Defaulting to index 0.")
+            spawn_index = 0
+
+        blueprints = self.blueprint_library.filter(vehicle_filter)
+        if not blueprints:
+            print(f"No vehicle blueprint found for filter: {vehicle_filter}")
+            return None
+
+        blueprint = blueprints[0]
+        transform = spawn_points[spawn_index]
+        
+        vehicle = self.world.try_spawn_actor(blueprint, transform)
+        if vehicle:
+            vehicle_state = VehicleState(
+                actor=vehicle,
+                wheelbase=self.get_wheelbase(vehicle),
+                desired_speed=0.0
+            )
+            self.vehicles.append(vehicle_state)
+            print(f"Spawned ego vehicle: {vehicle.type_id}")
+            return vehicle
+
+        return None
 
     def get_wheelbase(self, vehicle: carla.Vehicle) -> float:
         """
@@ -65,7 +126,13 @@ class VehicleManager:
         
         return steer_angle
 
-    def get_next_kinematic_pose(self, current_transform: carla.Transform, velocity: float, steer_angle: float, L: float, dt: float) -> carla.Transform:
+    def get_next_kinematic_pose(
+            self, 
+            current_transform: carla.Transform, 
+            velocity: float, 
+            steer_angle: float,
+            L: float,
+            dt: float) -> carla.Transform:
         """
         @brief Update pose using the Kinematic Bicycle Model.
 
@@ -93,54 +160,16 @@ class VehicleManager:
             carla.Rotation(yaw=np.degrees(new_theta))
         )
 
-    def spawn_ego_vehicle(
-        self,
-        vehicle_filter: str = "vehicle.tesla.model3",
-        spawn_index: int = 0
-    ) -> Optional[carla.Vehicle]:
-        """
-        @brief Spawn an ego vehicle in the CARLA world.
-
-        @param vehicle_filter Blueprint filter string for the desired model.
-        @param spawn_index The index of the map spawn point to utilise.
-        @return The spawned carla.Vehicle instance, or None if the operation fails.
-        """
-        spawn_points = self.world.get_map().get_spawn_points()
-        if not spawn_points:
-            print("No spawn points available in the current map.")
-            return None
-
-        if spawn_index >= len(spawn_points):
-            print(f"Spawn index {spawn_index} is out of range. Defaulting to index 0.")
-            spawn_index = 0
-
-        blueprints = self.blueprint_library.filter(vehicle_filter)
-        if not blueprints:
-            print(f"No vehicle blueprint found for filter: {vehicle_filter}")
-            return None
-
-        blueprint = blueprints[0]
-        transform = spawn_points[spawn_index]
-        vehicle = self.world.try_spawn_actor(blueprint, transform)
-
-        if vehicle is None:
-            print("Failed to spawn ego vehicle.")
-            return None
-
-        self.spawned_vehicles.append(vehicle)
-        print(f"Spawned ego vehicle: {vehicle.type_id}")
-        return vehicle
-
     def destroy_all(self) -> None:
         """
         @brief Destroy all vehicle actors managed by this instance.
         """
-        for vehicle in self.spawned_vehicles:
+        for vehicle in self.vehicles:
             try:
-                if vehicle.is_alive:
-                    vehicle.destroy()
+                if vehicle.actor.is_alive:
+                    vehicle.actor.destroy()
             except RuntimeError as exc:
                 print(f"Failed to destroy vehicle {vehicle.id}: {exc}")
 
-        self.spawned_vehicles.clear()
+        self.vehicles.clear()
         print("Destroyed all managed vehicles.")
