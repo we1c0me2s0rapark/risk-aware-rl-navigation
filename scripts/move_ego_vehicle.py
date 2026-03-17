@@ -10,6 +10,7 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "s
 
 from carla_client.connection import connect_carla, configure_simulation
 from carla_client.vehicle_manager import VehicleManager
+from carla_client.spectator_manager import SpectatorManager
 from carla_client.utilities import is_q_pressed
 
 def main() -> None:
@@ -38,9 +39,16 @@ def main() -> None:
         # Set synchronous mode for deterministic behaviour and to control the simulation step manually.
         configure_simulation(client, world, sync_mode=True, dt=DT)
 
-        # Spawn ego vehicle
+        # Instantiate the vehicle and spectator managers
         vehicle_manager = VehicleManager(world)
-        vehicle_manager.destroy_all()
+        spec_manager = SpectatorManager(world)
+
+        if vehicle_manager is None:
+            raise RuntimeError("💥 Failed to initialise VehicleManager.")
+        if spec_manager is None:
+            raise RuntimeError("💥 Failed to initialise SpectatorManager.")
+
+        # Spawn the ego vehicle
         ego_vehicle = vehicle_manager.spawn_ego_vehicle()
 
         if ego_vehicle is None:
@@ -96,23 +104,7 @@ def main() -> None:
             current_new_yaw = new_transform.rotation.yaw
 
             # Move spectator to follow the ego vehicle
-            local_offset = carla.Location(x=-5, y=0, z=3) # 5m behind and 3m above the vehicle
-            rotation = carla.Rotation(yaw=current_new_yaw) # rotate the offset to match the vehicle's orientation
-
-            rotated_offset = \
-                rotation.get_forward_vector() * local_offset.x \
-                + rotation.get_right_vector() * local_offset.y \
-                + rotation.get_up_vector() * local_offset.z # convert the offset into global coordinates relative to the car's facing direction
-
-            spec_location = new_transform.location + rotated_offset # apply the rotated offset to the vehicle's location to get the spectator's location
-
-            spec_transform = carla.Transform(
-                spec_location, 
-                carla.Rotation(pitch=-15, yaw=current_new_yaw, roll=0)
-            )
-
-            spectator = world.get_spectator()
-            spectator.set_transform(spec_transform)
+            spec_manager.set_chase_view(ego_vehicle)
 
             # Tick the world to apply changes
             world.tick()
