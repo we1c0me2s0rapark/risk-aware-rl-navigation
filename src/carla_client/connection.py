@@ -1,4 +1,5 @@
 import carla
+import random
 import subprocess
 from typing import Optional, List
 
@@ -92,8 +93,32 @@ def connect_carla(port: int = 2000, timeout: float = 5.0) -> Optional[carla.Worl
 
     for host in hosts:
         client, world = attempt_connection(host, port, timeout)
-        if world:
-            return client, world
+        if world: return client, world
 
     print(f"Could not connect to CARLA on hosts: {hosts}")
     return None, None
+
+def configure_simulation(client: carla.Client, world: carla.World, sync_mode: bool = True, dt: float = 0.05, seed: Optional[int] = None) -> None:
+    """
+    @brief Configure the CARLA simulation settings.
+
+    @param client The carla.Client instance.
+    @param world The carla.World instance to configure.
+    @param sync_mode Whether to enable synchronous mode.
+    @param dt The fixed delta seconds for the simulation step.
+    """
+    settings = world.get_settings()
+    settings.synchronous_mode = sync_mode
+    settings.fixed_delta_seconds = dt if sync_mode else None
+    world.apply_settings(settings)
+    
+    # If enabling sync mode, we must also configure the Traffic Manager
+    # to be synchronous to prevent vehicle jitters.
+    if not sync_mode: return
+
+    traffic_manager = client.get_trafficmanager(8000)
+    traffic_manager.set_synchronous_mode(True)
+
+    if seed is not None: random_seed = seed
+    else: random_seed = random.randint(0, 999999)
+    traffic_manager.set_random_device_seed(random_seed)

@@ -2,29 +2,15 @@ import os
 import sys
 import tty
 import termios
-import select
 import carla
 import numpy as np
 
 # Allow importing from the src directory.
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "src")))
 
-from carla_client.connection import connect_carla
+from carla_client.connection import connect_carla, configure_simulation
 from carla_client.vehicle_manager import VehicleManager
-
-def is_q_pressed() -> bool:
-    """
-    @brief Check whether the 'q' key has been pressed.
-
-    Uses non-blocking input to detect a single key press without requiring Enter.
-    
-    @return True if 'q' was pressed; False otherwise.
-    """
-    dr, _, _ = select.select([sys.stdin], [], [], 0)
-    if dr:
-        ch = sys.stdin.read(1)
-        return ch.lower() == "q"
-    return False
+from carla_client.utilities import is_q_pressed
 
 def main() -> None:
     """
@@ -49,11 +35,8 @@ def main() -> None:
         DT = 0.05 # time step for kinematic updates (s)
         LOOK_AHEAD = 1.0 # distance to find next waypoint
 
-        # Set synchronous mode for deterministic behaviour
-        settings = world.get_settings()
-        settings.synchronous_mode = True
-        settings.fixed_delta_seconds = DT
-        world.apply_settings(settings)
+        # Set synchronous mode for deterministic behaviour and to control the simulation step manually.
+        configure_simulation(client, world, sync_mode=True, dt=DT)
 
         # Spawn ego vehicle
         vehicle_manager = VehicleManager(world)
@@ -140,13 +123,11 @@ def main() -> None:
     finally:
         termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
         
-        if 'world' in locals():
+        if 'world' in locals() and world is not None and 'client' in locals() and client is not None:
             print("Resetting simulation settings...")
-            settings = world.get_settings()
-            settings.synchronous_mode = False
-            world.apply_settings(settings)
+            configure_simulation(client, world, sync_mode=False)
 
-        if 'vehicle_manager' in locals():
+        if 'vehicle_manager' in locals() and vehicle_manager is not None:
             print("Cleaning up vehicle...")
             vehicle_manager.destroy_all()
 
