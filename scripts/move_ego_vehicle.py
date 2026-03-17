@@ -2,7 +2,6 @@ import os
 import sys
 import tty
 import termios
-import select
 import carla
 import numpy as np
 
@@ -11,20 +10,7 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "s
 
 from carla_client.connection import connect_carla, configure_simulation
 from carla_client.vehicle_manager import VehicleManager
-
-def is_q_pressed() -> bool:
-    """
-    @brief Check whether the 'q' key has been pressed.
-
-    Uses non-blocking input to detect a single key press without requiring Enter.
-    
-    @return True if 'q' was pressed; False otherwise.
-    """
-    dr, _, _ = select.select([sys.stdin], [], [], 0)
-    if dr:
-        ch = sys.stdin.read(1)
-        return ch.lower() == "q"
-    return False
+from carla_client.utilities import is_q_pressed
 
 def main() -> None:
     """

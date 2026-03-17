@@ -2,7 +2,6 @@ import os
 import sys
 import tty
 import termios
-import select
 import carla
 
 # Allow importing from the src directory
@@ -11,21 +10,8 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "s
 from carla_client.connection import connect_carla, configure_simulation
 from carla_client.vehicle_manager import VehicleManager
 from carla_client.pedestrian_manager import PedestrianManager
+from carla_client.utilities import is_q_pressed
 
-def is_q_pressed() -> bool:
-    """
-    @brief Detects whether the 'q' key has been pressed.
-
-    Utilises non-blocking standard input to capture a single key press
-    without requiring the user to press Enter.
-
-    @return True if the 'q' key is pressed; otherwise False.
-    """
-    dr, _, _ = select.select([sys.stdin], [], [], 0)
-    if dr:
-        ch = sys.stdin.read(1)
-        return ch.lower() == "q"
-    return False
 
 def main() -> None:
     """
