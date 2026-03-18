@@ -1,13 +1,22 @@
-# ==========================
-# Build / compiled files
-# ==========================
-# Object files
+#==============================================================================
+# @brief Git ignore configuration for CARLA-based perception and control project.
+#
+# Excludes build artefacts, Python environments, generated documentation,
+# logs, and temporary files to maintain a clean repository state.
+#==============================================================================
+
+
+#==============================================================================
+# Build / Compiled Files
+#==============================================================================
+
+## Object files
 *.o
 *.obj
 *.lo
 *.slo
 
-# Libraries
+## Static and dynamic libraries
 *.a
 *.lib
 *.la
@@ -16,51 +25,65 @@
 *.dylib
 *.dll
 
-# Executables
+## Executables and binaries
 *.exe
 *.out
 *.app
 
-# Debug / linker
+## Debugging and linker artefacts
 *.pdb
 *.ilk
 *.dwo
 
-# Precompiled headers
+## Precompiled headers
 *.gch
 *.pch
 
-# Fortran module files
+## Fortran module files (if applicable)
 *.mod
 *.smod
 
-# ==========================
-# Python
-# ==========================
-# Virtual environment
+
+#==============================================================================
+# Python Environment and Bytecode
+#==============================================================================
+
+## Virtual environments
 .venv/
 
-# Bytecode
+## Compiled Python bytecode
 __pycache__/
 *.pyc
 
-# Jupyter Notebook checkpoints
+## Jupyter Notebook checkpoints
 .ipynb_checkpoints/
 
-# ==========================
-# Project folders / logs
-# ==========================
+
+#==============================================================================
+# Project Runtime Outputs
+#==============================================================================
+
+## Training runs, logs, and checkpoints
 runs/
 logs/
 checkpoints/
 
-# ==========================
-# Documentation
-# ==========================
+
+#==============================================================================
+# Documentation Outputs
+#==============================================================================
+
+## Doxygen configuration and generated HTML
 Doxyfile
 html/
 
-# ==========================
-# Notes / temporary files
-# ==========================
+
+#==============================================================================
+# Temporary Files and Notes
+#==============================================================================
+
+## Developer notes and scratch files
 note*
+
+## Local CARLA builds or extracted directories
+carla/

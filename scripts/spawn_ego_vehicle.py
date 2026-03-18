@@ -33,7 +33,7 @@ def main() -> None:
         print("Ego vehicle spawn failed.")
 
     # Prevent immediate script termination to allow for visual verification
-    if vehicle_manager.spawned_vehicles:
+    if vehicle_manager.vehicles:
         input("Press Enter to destroy vehicles and exit...")
         vehicle_manager.destroy_all()
 
