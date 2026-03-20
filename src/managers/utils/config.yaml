@@ -1,0 +1,67 @@
+# =============================================================================
+# @file config.yaml
+# @brief Configuration for CARLA-based simulation, sensors, and action space.
+#
+# Defines simulation timing, sensor specifications, and control constraints
+# used by the perception and reinforcement learning pipeline.
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# @section simulation Simulation Settings
+# @brief Core simulation parameters controlling timing and execution behaviour.
+# -----------------------------------------------------------------------------
+simulation:
+  port: 2000                # @brief CARLA server port.
+  sync_mode: true           # @brief Enable synchronous simulation stepping.
+  dt: 0.05                  # @brief Fixed time-step in seconds (simulation delta time).
+  max_episode_length: 250   # @brief Maximum number of steps per episode.
+
+
+# -----------------------------------------------------------------------------
+# @section sensors Sensor Configuration
+# @brief Defines camera and LiDAR sensor characteristics and data shapes.
+# -----------------------------------------------------------------------------
+sensors:
+
+  # ---------------------------------------------------------------------------
+  # @subsection camera RGB Camera
+  # @brief Camera configuration for both training and visualisation.
+  # ---------------------------------------------------------------------------
+  camera:
+    train_resolution: { x: 84, y: 84 }     # @brief Input resolution (width x height) for ML models.
+    view_resolution: { x: 800, y: 600 }    # @brief Display resolution for visualisation.
+    channels: 3                            # @brief Number of colour channels (RGB).
+
+    # @note Total elements per frame:
+    #       84 × 84 × 3 = 21,168
+
+
+  # ---------------------------------------------------------------------------
+  # @subsection lidar LiDAR Sensor
+  # @brief LiDAR configuration for spatial perception.
+  # ---------------------------------------------------------------------------
+  lidar:
+    points: 1024              # @brief Number of sampled points per frame.
+    features_per_point: 3     # @brief Features per point (x, y, z).
+    range: 50                 # @brief Maximum sensing range in metres.
+
+    # @note Total elements per frame:
+    #       1024 × 3 = 3,072
+
+
+# -----------------------------------------------------------------------------
+# @section actions Action Space Constraints
+# @brief Defines valid control ranges for the agent.
+# -----------------------------------------------------------------------------
+actions:
+  steer: [-1.0, 1.0]     # @brief Steering angle (-1.0 full left, 1.0 full right).
+  throttle: [0.0, 1.0]   # @brief Throttle input (0.0 none, 1.0 maximum).
+  brake: [0.0, 1.0]      # @brief Brake input (0.0 none, 1.0 full braking).
+
+
+# ---------------------------------------------------------------------------
+# @section render Render Settings
+# @brief Defines the rendering mode for the environment.
+# ---------------------------------------------------------------------------
+render:
+  mode: human            # @brief Rendering mode: 'human' or 'rgb_array'.

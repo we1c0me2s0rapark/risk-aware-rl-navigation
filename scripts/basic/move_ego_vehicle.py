@@ -3,39 +3,32 @@ import sys
 import tty
 import termios
 import carla
-import random
-import time
 import numpy as np
 
-# Allow importing from the src directory
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "src")))
+try:
+    # Allow importing from the src directory.
+    sys.path.append(os.path.abspath(os.path.join(
+        os.path.dirname(__file__), "..", "..", "src"
+    )))
 
-from carla_client.connection import connect_carla, configure_simulation
-from carla_client.sensor_manager import SensorVisualiser
-from carla_client.vehicle_manager import VehicleManager
-from carla_client.spectator_manager import SpectatorManager
-from carla_client.utilities import is_q_pressed
+    from carla_client.connection import connect_carla, configure_simulation
+    from carla_client.utilities import is_q_pressed
+    from managers.actors import VehicleManager
+    from managers.utils import SpectatorManager
+except ImportError as e:
+    print(f"[{__name__}] Error: {e}")
 
-def main():
+def main() -> None:
     """
-    @brief Entry point for ego vehicle control with integrated sensor visualisation.
+    @brief Test ego vehicle spawning and kinematic tracking in CARLA.
 
-    Connects to the CARLA simulator, spawns a single ego vehicle, and attaches
-    RGB camera and LiDAR sensors. Sensor data is streamed to a visualisation
-    module for real-time rendering, while the vehicle is advanced using a
-    kinematic bicycle model.
-
-    The simulation runs in synchronous mode to ensure deterministic stepping.
-    A spectator camera follows the ego vehicle, and all allocated resources
-    (sensors, vehicles, and visualiser) are safely released upon termination.
+    Connects to the CARLA server, spawns an ego vehicle, disables physics,
+    and updates the pose using a kinematic bicycle model. Press 'q' to quit.
     """
 
     # Preserve terminal configuration for later restoration
     fd = sys.stdin.fileno()
     old_settings = termios.tcgetattr(fd)
-
-    # Container for tracking spawned sensor actors
-    sensors = []
 
     try:
         print("Connecting to CARLA...")
@@ -60,7 +53,6 @@ def main():
         if spec_manager is None:
             raise RuntimeError("Failed to initialise SpectatorManager.")
 
-        # Remove any pre-existing vehicles from the simulation
         vehicle_manager.destroy_all()
 
         # Spawn the ego vehicle
@@ -69,15 +61,14 @@ def main():
         if ego_vehicle is None:
             raise RuntimeError("Failed to spawn ego vehicle.")
         
-        # Retrieve and report vehicle wheelbase
         L = vehicle_manager.get_wheelbase(ego_vehicle)
         print(f"Calculated wheelbase for {ego_vehicle.type_id}: {L:.2f}m")
 
-        # Disable physics to allow direct kinematic control
+        # Disable physics for pure kinematic control
         if ego_vehicle.is_alive:
             ego_vehicle.set_simulate_physics(False)
 
-        # Tick the world to register spawned actors and configuration changes
+        # Tick the world to register the spawned vehicle and the physics change
         world.tick()
 
         print("Tracking started... Press 'q' to stop.")
@@ -88,45 +79,7 @@ def main():
         if not ego_vehicle.is_alive:
             raise RuntimeError(f"Vehicle {ego_vehicle.id} no longer alive.")
 
-        # ---------------------------------------------------------------------
-        # Sensor Configuration
-        # ---------------------------------------------------------------------
-        blueprint_library = world.get_blueprint_library()
-
-        # Configure RGB camera sensor
-        camera_bp = blueprint_library.find('sensor.camera.rgb')
-        camera_bp.set_attribute('image_size_x', '800')
-        camera_bp.set_attribute('image_size_y', '600')
-        camera_bp.set_attribute('fov', '90')
-        
-        # Mount at the front of the vehicle with slight elevation
-        camera_transform = carla.Transform(carla.Location(x=1.5, z=2.4))
-        camera = world.spawn_actor(camera_bp, camera_transform, attach_to=ego_vehicle)
-        sensors.append(camera)
-
-        # Configure LiDAR sensor
-        lidar_bp = blueprint_library.find('sensor.lidar.ray_cast')
-        lidar_bp.set_attribute('range', '50')
-        lidar_bp.set_attribute('channels', '32')
-        lidar_bp.set_attribute('points_per_second', '100000')
-        
-        # Mount centrally on the vehicle roof
-        lidar_transform = carla.Transform(carla.Location(x=0, z=2.5))
-        lidar = world.spawn_actor(lidar_bp, lidar_transform, attach_to=ego_vehicle)
-        sensors.append(lidar)
-
-        # Initialise sensor visualisation module
-        visualiser = SensorVisualiser(width=800, height=1000)
-        
-        # Register sensor callbacks
-        camera.listen(lambda image: visualiser.camera_callback(image))
-        lidar.listen(lambda data: visualiser.lidar_callback(data))
-
-        # ---------------------------------------------------------------------
-        # Main Simulation Loop
-        # ---------------------------------------------------------------------
         while True:
-            # Exit condition via keyboard input
             if is_q_pressed():
                 print("\n'q' pressed - Bye! 👋\n")
                 break
@@ -141,11 +94,10 @@ def main():
                 print("No waypoints found ahead of the vehicle.")
                 break
             
-            # Select target waypoint and define constant velocity
             target_wp = candidates[0] # pick the first candidate for simplicity
             target_v = 0.75 # set a constant speed of 0.75 m/s for testing
 
-            # Compute steering command towards the waypoint
+            # Compute steering command towards the target waypoint
             steer_angle = vehicle_manager.calculate_steering_to_waypoint(current_transform, target_wp)
 
             # Predict next pose using kinematic bicycle model
@@ -157,13 +109,15 @@ def main():
                 DT
             )
             
-            # Apply updated transform
             ego_vehicle.set_transform(new_transform)
 
-            # Update spectator to follow the ego vehicle
+            # Extract the updated yaw from the new transform
+            current_new_yaw = new_transform.rotation.yaw
+
+            # Move spectator to follow the ego vehicle
             spec_manager.set_chase_view(ego_vehicle)
 
-            # Advance simulation
+            # Tick the world to apply changes
             world.tick()
 
     except Exception as e:
@@ -172,18 +126,11 @@ def main():
     finally:
         # Restore terminal configuration
         termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
-
-        # Close visualisation window if initialised
-        if 'visualiser' in locals() and visualiser:
-            visualiser.close()
         
         # Reset simulation to asynchronous mode
         if 'world' in locals() and world is not None and 'client' in locals() and client is not None:
             print("Resetting simulation settings...")
             configure_simulation(client, world, sync_mode=False)
-
-            print("Cleaning up sensors...")
-            client.apply_batch([carla.command.DestroyActor(x) for x in sensors if x is not None and x.is_alive])
 
         # Clean up all managed vehicles
         if 'vehicle_manager' in locals() and vehicle_manager is not None:
@@ -192,5 +139,5 @@ def main():
 
         print("\nSuccessfully exited 🎯✨")
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()

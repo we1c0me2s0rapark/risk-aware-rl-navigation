@@ -5,13 +5,18 @@ import termios
 import carla
 import numpy as np
 
-# Allow importing from the src directory.
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "src")))
+try:
+    # Allow importing from the src directory.
+    sys.path.append(os.path.abspath(os.path.join(
+        os.path.dirname(__file__), "..", "..", "src"
+    )))
 
-from carla_client.connection import connect_carla, configure_simulation
-from carla_client.vehicle_manager import VehicleManager
-from carla_client.spectator_manager import SpectatorManager
-from carla_client.utilities import is_q_pressed
+    from carla_client.connection import connect_carla, configure_simulation
+    from carla_client.utilities import is_q_pressed
+    from managers.actors import VehicleManager
+    from managers.utils import SpectatorManager
+except ImportError as e:
+    print(f"[{__name__}] Error: {e}")
 
 def main() -> None:
     """
