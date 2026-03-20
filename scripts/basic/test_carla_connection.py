@@ -1,11 +1,16 @@
 import sys
 import os
 
-# Allow importing from src/
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "src")))
+try:
+    # Allow importing from src/
+    sys.path.append(os.path.abspath(os.path.join(
+        os.path.dirname(__file__), "..", "..", "src"
+    )))
 
-from carla_client.connection import connect_carla
-from carla_client.diagnostics import print_world_summary
+    from carla_client.connection import connect_carla
+    from carla_client.diagnostics import print_world_summary
+except ImportError as e:
+    print(f"[{__name__}] Error: {e}")
 
 def main() -> None:
     """
