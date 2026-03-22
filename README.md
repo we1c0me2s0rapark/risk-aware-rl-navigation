@@ -9,6 +9,12 @@
 
 ---
 
+## Project Status
+
+Track live progress, milestones, and the backlog on the **[GitHub Project Board](https://github.com/users/we1c0me2s0rapark/projects/1/views/4)**
+
+---
+
 ## Overview
 
 This project develops a **risk-aware autonomous driving agent** in the [CARLA](https://carla.org) simulator. Rather than optimising purely for reward, the agent explicitly models and minimises **tail risk** - catastrophic, low-probability events like collisions.
