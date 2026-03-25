@@ -36,11 +36,11 @@ This project develops a **risk-aware autonomous driving agent** in the [CARLA](h
 ```
        ┌──────────┐      ┌───────────┐
 Camera │          │      │           │
-LiDAR  │   CNNs   │────▶│  Fusion   │
+LiDAR  │   CNNs   │────▶│   Fusion  │
        └──────────┘      └─────┬─────┘
                                │
                                ▼
-                              LSTM
+                             LSTM
                                │
                   ┌────────────┴────────────┐
                   ▼                         ▼
@@ -65,12 +65,14 @@ The project is built incrementally. **Do not introduce risk modelling before ach
 
 **Goal:** Establish a stable end-to-end RL pipeline.
 
+> Proximal Policy Optimisation (PPO) is used in this phase as a stable baseline algorithm to validate the environment, observations, and reward design before transitioning to SAC.
+
 - Gym-compatible `CarlaEnv` with synchronous simulation mode
 - RGB camera (84×84)
 - Basic reward: `+speed`, `-collision (terminal)`
-- SAC agent with CNN encoder + MLP actor/critic heads
+- PPO agent with CNN encoder + MLP actor/critic heads
 
-**Deliverable:** Agent demonstrates stable forward driving.
+**Deliverable:** Agent demonstrates stable forward driving and learnable behaviour.
 
 ---
 
