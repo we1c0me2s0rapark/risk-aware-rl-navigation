@@ -30,6 +30,7 @@ def main():
 
     env = None
     total_reward = 0.0
+    total_baseline = 0.0
     step_count = 0
 
     frame_idx = 0
@@ -53,22 +54,25 @@ def main():
             env.render(save=False)
 
             total_reward += reward
+            total_baseline += info.get('baseline_reward', 0.0)
+
             step_count += 1
 
-            print(
-                f"Step {step_count:03d} | Reward: {reward:.2f} | Done: {done} | "
-                f"Collision count: {info['collision']}"
-            )
+            print(f"""[ Risk ]
+    Step {step_count:03d} | Done: {done} | Min TTC: {info.get('ttc_min', float('inf')):.2f}s""")
+            print(f"""[ Reward Comparison ]
+    Baseline: {info['baseline_reward']:.2f} | Risk-aware: {info['risk_reward']:.2f} | Collision: {info['collision']}""")
 
             # Slow down for human observation
             time.sleep(0.05)
 
     except Exception as e:
-        print(f"[{__name__}] Error: {e}")
+        print(f"[{__file__}] Error: {e}")
 
     finally:
         print(
-            f"Episode finished after {step_count} steps, "
+            f"🏳️  Episode finished after {step_count} steps; "
+            f"baseline reward: {total_baseline:.2f}, "
             f"total reward: {total_reward:.2f}"
         )
 

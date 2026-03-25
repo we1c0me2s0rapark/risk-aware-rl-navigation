@@ -39,7 +39,7 @@ class VehicleManager:
         self.blueprint_library = world.get_blueprint_library()
         self.vehicles: List[VehicleState] = []
 
-    def spawn_ego_vehicle(self, vehicle_filter: str = "vehicle.tesla.model3", spawn_index: int = 0) -> Optional[carla.Vehicle]:
+    def spawn_ego_vehicle(self, vehicle_filter: str = "vehicle.tesla.model3", spawn_index: int = 0, set_physics: bool = False) -> Optional[carla.Vehicle]:
         """
         @brief Spawn an ego vehicle in the CARLA world.
 
