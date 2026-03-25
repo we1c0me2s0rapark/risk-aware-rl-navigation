@@ -56,14 +56,14 @@ actions:
   throttle: [0.0, 1.0]      # @brief Throttle input (0.0 none, 1.0 maximum).
   brake: [0.0, 1.0]         # @brief Brake input (0.0 none, 1.0 full braking).
 
-# --------------------------------------------------------------------------- 
+# ----------------------------------------------------------------------------- 
 # @section render Render Settings
 # @brief Defines the rendering mode for the environment.
 # -----------------------------------------------------------------------------
 render:
   mode: human                   # @brief Rendering mode: 'human' (display GUI) or 'rgb_array' (return frame).
 
-# ---------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 # @section risk Risk Module Settings
 # @brief Parameters controlling risk-aware feature computation.
 # -----------------------------------------------------------------------------
