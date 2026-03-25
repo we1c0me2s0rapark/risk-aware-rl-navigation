@@ -1,5 +1,6 @@
 import os
 import sys
+import random
 import numpy as np
 from datetime import datetime
 from dataclasses import dataclass, field
@@ -13,6 +14,8 @@ try:
     from managers.actors import VehicleManager
     from managers.sensors import SensorManager
     from managers.utils.config_manager import load_config
+    from risk.module import RiskModule, AGENT_FEAT_DIM
+    from env.reward import risk_aware_reward
 except ImportError as e:
     print(f"[{__name__}] Error: {e}")
 
@@ -94,10 +97,12 @@ class CarlaEnv(gym.Env):
 
         obs_dim = camera_dim + lidar_dim
 
+        self.risk_module = RiskModule(self.config)
+        risk_dim = self.risk_module.feature_dim
+
         self.observation_space = spaces.Box(
-            low=0.0,
-            high=1.0,
-            shape=(obs_dim,),
+            low=0.0, high=1.0,
+            shape=(obs_dim + risk_dim,),
             dtype=np.float32
         )
 
@@ -125,6 +130,13 @@ class CarlaEnv(gym.Env):
         self.vehicle = None
         self.collision_history = []
         self.episode_length = 0
+        
+        self._risk_vec = None
+        self._ego = None
+        self._agents = None
+
+        self._destination = None
+        self._prev_dist_to_goal = None
 
     def reset(self):
         """
@@ -150,7 +162,7 @@ class CarlaEnv(gym.Env):
         timestamp = self.frame_record_state.start_time.strftime("%Y%m%d_%H%M%S")
         self.frame_record_state.file_path = os.path.join(file_dir, f"{timestamp}")
 
-        self.vehicle = self.vehicle_manager.spawn_ego_vehicle()
+        self.vehicle = self.vehicle_manager.spawn_ego_vehicle(set_physics=True)
         if self.vehicle is None:
             raise RuntimeError("Failed to spawn ego vehicle")
 
@@ -159,7 +171,15 @@ class CarlaEnv(gym.Env):
         self.episode_length = 0
         self.collision_history = []
 
+        self._risk_vec = None
+        self._ego = None
+        self._agents = None
+
         self.world.tick()
+
+        spawn_points = self.world.get_map().get_spawn_points()
+        self._destination = random.choice(spawn_points).location
+        self._prev_dist_to_goal = self.vehicle.get_location().distance(self._destination)
 
         return self._get_observation()
 
@@ -180,47 +200,282 @@ class CarlaEnv(gym.Env):
 
         self.episode_length += 1
 
+        steer, throttle, brake = self._apply_control(action)
+        self.world.tick()
+
+        self._ego = self._get_ego_state()
+        self._agents = self._get_nearby_actors()
+
+        self._risk_vec = self.risk_module.compute(self._ego, self._agents)
+
+        baseline_reward = self._compute_reward_baseline()
+        risk_reward = risk_aware_reward(
+            self._ego,
+            self._check_collision(),
+            self._compute_progress(),
+            self._risk_vec,
+            self.risk_module.top_k
+        )
+
+        reward = risk_reward # keep risk_reward as the main reward
+
+        obs = self._get_observation()
+
+        done = self._check_collision() or self._goal_reached() or self._timeout()
+
+        info = {
+            'collision': self._check_collision(),
+            'ttc_min':   float(self._risk_vec[4::AGENT_FEAT_DIM].min()),
+            'goal_dist': self._prev_dist_to_goal,
+            'baseline_reward': baseline_reward,
+            'risk_reward': risk_reward,
+        }
+
+        speed = np.sqrt(self._ego['vx']**2 + self._ego['vy']**2)
+
+        print(f"""[ Snapshot ]
+    Status: {'ALIVE 🟢' if self.vehicle.is_alive else 'DEAD 🔴'}
+    Pose: x {self._ego['x']:.2f}, y {self._ego['y']:.2f}, z {self._ego['z']:.2f}, yaw {self._ego['yaw']}
+    Speed: {speed} m/s
+    Control: steer {steer}, throttle {throttle}, brake {brake}""")
+
+        return obs, reward, done, info
+
+    def _apply_control(self, action) -> list[float]:
+        """
+        @brief Clip and apply a control action to the ego vehicle.
+        
+        @details
+        The action is first clipped to the valid ranges defined by the
+        action_space. Throttle and brake are mutually exclusive: if throttle
+        exceeds 0.05, brake is set to 0, and vice versa. The resulting control
+        is applied to the CARLA vehicle actor.
+
+        @param action numpy.ndarray Control vector [steer, throttle, brake].
+        @return list[float] Applied control values [steer, throttle, brake].
+        """
         steer, throttle, brake = np.clip(
             action,
             self.action_space.low,
             self.action_space.high
         )
 
-        control = carla.VehicleControl(
+        if throttle > 0.05: brake = 0.0
+        elif brake > 0.05: throttle = 0.0
+
+        self.vehicle.apply_control(carla.VehicleControl(
             steer=float(steer),
             throttle=float(throttle),
             brake=float(brake)
-        )
-        self.vehicle.apply_control(control)
+        ))
 
-        self.world.tick()
+        return steer, throttle, brake
 
-        obs = self._get_observation()
-        reward = self._compute_reward()
-        done = self._is_done()
-        info = {'collision': len(self.collision_history)}
+    def _check_collision(self) -> bool:
+        """
+        @brief Check if a collision has occurred in the current episode.
 
-        return obs, reward, done, info
+        @details
+        Returns True if any collision has been recorded by the
+        collision sensor attached to the ego vehicle during the episode.
+        Useful for terminating episodes or modifying rewards.
+
+        @return bool True if a collision has been detected, False otherwise.
+        """
+
+        return len(self.collision_history) > 0
+
+    def _compute_progress(self) -> float:
+        """
+        @brief Compute the progress made towards the goal during this step.
+
+        @details
+        The progress is defined as the change in Euclidean distance
+        from the ego vehicle to its destination between the previous
+        step and the current step. Positive values indicate that the
+        vehicle has approached the goal, negative values indicate moving
+        away from it. If no destination is set, the forward distance
+        travelled in metres over this timestep is returned as an approximation.
+
+        @return float Distance closed towards the goal in metres.
+            Positive if approaching the destination, negative if moving away.
+        """
+
+        if self._destination is None:
+            v = self.vehicle.get_velocity()
+            return float(np.sqrt(v.x**2 + v.y**2 + v.z**2) * self.config['simulation']['dt'])
+
+        current_dist = self.vehicle.get_location().distance(self._destination)
+        progress = self._prev_dist_to_goal - current_dist
+        self._prev_dist_to_goal = current_dist
+
+        return float(progress)
+
+    def _goal_reached(self) -> bool:
+        """
+        @brief Determine if the ego vehicle has reached its destination.
+
+        @details
+        Checks whether the Euclidean distance from the ego vehicle to
+        the destination is less than the configured goal threshold
+        in metres. If no destination is defined, the goal is considered
+        unreached.
+
+        @return bool True if the vehicle is within goal_threshold metres
+                    of the destination, False otherwise.
+        """
+
+        if self._destination is None: return False
+
+        dist = self.vehicle.get_location().distance(self._destination)
+
+        return dist < self.config['simulation'].get('goal_threshold', 5.0)
+
+    def _timeout(self) -> bool:
+        """
+        @brief Check if the episode has exceeded the maximum length.
+
+        @details
+        Returns True if the number of steps executed in the current
+        episode has reached or exceeded the maximum allowed by the
+        simulation configuration.
+
+        @return bool True if the episode is timed out, False otherwise.
+        """
+
+        return self.episode_length >= self.max_episode_length
+
+    def _get_ego_state(self) -> dict:
+        """
+        @brief Extract the current state of the ego vehicle.
+
+        @details
+        The state includes the vehicle's 3D position, velocity components,
+        yaw angle in radians, and bounding box dimensions. This information
+        is primarily used for risk computation and observation construction.
+
+        @return dict Dictionary containing the ego state:
+            - 'x', 'y', 'z': position coordinates in metres
+            - 'vx', 'vy': velocity components in metres per second
+            - 'yaw': heading angle in radians
+            - 'length', 'width': bounding box dimensions in metres
+        """
+        
+        transform = self.vehicle.get_transform()
+        velocity = self.vehicle.get_velocity()
+        bbox = self.vehicle.bounding_box
+
+        return {
+            'x': transform.location.x,
+            'y': transform.location.y,
+            'z': transform.location.z,
+            'vx': velocity.x,
+            'vy': velocity.y,
+            'yaw': np.deg2rad(transform.rotation.yaw),
+            'length': bbox.extent.x * 2,
+            'width': bbox.extent.y * 2,
+        }
+
+    def _get_nearby_actors(self, radius: float = 50.0) -> list[dict]:
+        """
+        @brief Retrieve nearby actors within a specified radius.
+
+        @details
+        Queries the CARLA world to find all vehicles and pedestrians
+        within a given Euclidean distance from the ego vehicle.
+        Each actor is represented as a dictionary containing its
+        position, velocity, heading, dimensions, and category.
+        Pedestrians are approximated with a fixed bounding box size.
+
+        @param radius float Search radius in metres around the ego vehicle.
+        @return list[dict] List of dictionaries, each representing a nearby actor:
+            - 'id': CARLA actor ID
+            - 'x', 'y': position coordinates in metres
+            - 'vx', 'vy': velocity components in metres per second
+            - 'yaw': heading in radians
+            - 'length', 'width': bounding box dimensions in metres
+            - 'category': 'vehicle' or 'walker'
+        """
+
+        ego_loc = self.vehicle.get_location()
+        actors  = []
+
+        actor_list = self.world.get_actors()
+
+        for actor in actor_list.filter('vehicle.*'):
+            if actor.id == self.vehicle.id: continue
+            if actor.get_location().distance(ego_loc) > radius: continue
+
+            t = actor.get_transform()
+            v = actor.get_velocity()
+            bb = actor.bounding_box
+            actors.append({
+                'id': actor.id,
+                'x': t.location.x,
+                'y': t.location.y,
+                'vx': v.x,
+                'vy': v.y,
+                'yaw': np.deg2rad(t.rotation.yaw),
+                'length': bb.extent.x * 2,
+                'width': bb.extent.y * 2,
+                'category': 'vehicle',
+            })
+
+        for actor in actor_list.filter('walker.pedestrian.*'):
+            if actor.get_location().distance(ego_loc) > radius: continue
+
+            t = actor.get_transform()
+            v = actor.get_velocity()
+            actors.append({
+                'id': actor.id,
+                'x': t.location.x,
+                'y': t.location.y,
+                'vx': v.x,
+                'vy': v.y,
+                'yaw': np.deg2rad(t.rotation.yaw),
+                'length': 0.5,
+                'width': 0.5,
+                'category': 'walker',
+            })
+
+        return actors
 
     def _get_observation(self):
         """
         @brief Retrieve the current observation vector.
 
-        Combines processed camera and LiDAR data into a
-        flattened and normalised vector suitable for ML pipelines.
+        @details
+        Combines camera, LiDAR, and risk feature data into a flattened
+        normalised vector. Uses cached risk vector if available to avoid
+        recomputation, otherwise computes a fresh risk vector based on
+        the current ego state and nearby actors.
 
-        @return numpy.ndarray Observation vector.
+        @return numpy.ndarray Observation vector, combining:
+            - Flattened camera frame
+            - Flattened LiDAR point cloud
+            - Risk feature vector
         """
 
         lidar_config = self.config['sensors']['lidar']
         cam_config = self.config['sensors']['camera']['train_resolution']
 
-        return self.sensor_manager.get_observation(
+        sensor_obs = self.sensor_manager.get_observation(
             camera_resolution=(cam_config['x'], cam_config['y']),
             lidar_points=lidar_config['points']
         )
 
-    def _compute_reward(self):
+        # Use the risk vector cached by step() if available,
+        # otherwise compute fresh (e.g. during reset() before step() is called).
+        if hasattr(self, '_risk_vec') and self._risk_vec is not None:
+            risk_vec = self._risk_vec
+        else:
+            ego = getattr(self, '_ego', None) or self._get_ego_state()
+            agents = getattr(self, '_agents', None) or self._get_nearby_actors()
+            risk_vec = self.risk_module.compute(ego, agents)
+
+        return np.concatenate([sensor_obs, risk_vec.astype(np.float32)])
+
+    def _compute_reward_baseline(self):
         """
         @brief Compute the reward for the current timestep.
 
@@ -233,17 +488,13 @@ class CarlaEnv(gym.Env):
 
         v = self.vehicle.get_velocity()
         speed = np.sqrt(v.x**2 + v.y**2 + v.z**2)
-
         reward = speed * 0.05
-
         if len(self.collision_history) > 0:
             reward -= 10.0
-
         reward -= abs(self.vehicle.get_control().steer) * 0.01
-
         return reward
 
-    def _is_done(self):
+    def _is_done_baseline(self):
         """
         @brief Check whether the episode has terminated.
 
@@ -254,16 +505,19 @@ class CarlaEnv(gym.Env):
         @return bool True if the episode is done, False otherwise.
         """
 
-        return (
-            len(self.collision_history) > 0 or
-            self.episode_length >= self.max_episode_length
-        )
+        return (len(self.collision_history) > 0 or self.episode_length >= self.max_episode_length)
 
     def _setup_sensors(self):
         """
-        @brief Attach sensors to the ego vehicle.
+        @brief Attach and initialise sensors on the ego vehicle.
 
-        Configures camera resolution and LiDAR range based on configuration.
+        @details
+        Configures and attaches all required sensors (camera and LiDAR) to
+        the ego vehicle using the SensorManager. Camera resolution and LiDAR
+        range are read from the loaded configuration. Collision history is
+        initialised and linked to the sensor manager for later queries.
+
+        @note The sensors must be attached after the ego vehicle has been spawned.
         """
 
         lidar_config = self.config['sensors']['lidar']
@@ -282,7 +536,13 @@ class CarlaEnv(gym.Env):
         """
         @brief Destroy all active actors in the environment.
 
-        Ensures proper cleanup of ego vehicle and attached sensors.
+        @details
+        Ensures proper cleanup of the ego vehicle and all attached sensors.
+        Resets collision history to an empty list. This function should be
+        called when resetting the environment or closing it to prevent
+        resource leaks.
+
+        @note Calling this method does not remove non-ego actors from the world.
         """
 
         if self.vehicle is not None:
