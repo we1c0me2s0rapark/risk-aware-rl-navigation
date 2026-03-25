@@ -82,8 +82,4 @@ html/
 # Temporary Files and Notes
 #==============================================================================
 
-## Developer notes and scratch files
-note*
-
-## Local CARLA builds or extracted directories
-carla/
+tmp/

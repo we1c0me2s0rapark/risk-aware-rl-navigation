@@ -18,6 +18,13 @@ simulation:
   goal_threshold: 5.0         # @brief Distance threshold (metres) for goal achievement.
 
 # ----------------------------------------------------------------------------- 
+# @section render Render Settings
+# @brief Defines the rendering mode for the environment.
+# -----------------------------------------------------------------------------
+render:
+  mode: human                   # @brief Rendering mode: 'human' (display GUI) or 'rgb_array' (return frame).
+
+# ----------------------------------------------------------------------------- 
 # @section sensors Sensor Configuration
 # @brief Defines camera and LiDAR sensor characteristics and data shapes.
 # -----------------------------------------------------------------------------
@@ -28,7 +35,7 @@ sensors:
   # @brief Camera configuration for both training and visualisation.
   # ---------------------------------------------------------------------------
   camera:
-    train_resolution: { x: 84, y: 84 }     # @brief Input resolution (width × height) for ML models.
+    train_resolution: { x: 84, y: 84 }     # @brief Input resolution (width × height) for machine learning models.
     view_resolution: { x: 800, y: 600 }    # @brief Display resolution for visualisation.
     channels: 3                            # @brief Number of colour channels (RGB).
 
@@ -40,9 +47,11 @@ sensors:
   # @brief LiDAR configuration for spatial perception.
   # ---------------------------------------------------------------------------
   lidar:
-    points: 1024              # @brief Number of sampled points per frame.
-    features_per_point: 3     # @brief Features per point (x, y, z).
-    range: 50                 # @brief Maximum sensing range in metres.
+    points: 1024                          # @brief Number of sampled points per frame.
+    features_per_point: 3                 # @brief Features per point (x, y, z).
+    range: 50                             # @brief Maximum sensing range in metres.
+    train_resolution: { x: 64, y: 64 }    # @brief Input resolution (width × height) for machine learning models.
+    channels: 1                           # @brief Number of colour channels (Greyscale/Monochrome).
 
     # @note Total elements per frame:
     #       1024 × 3 = 3,072
@@ -55,13 +64,6 @@ actions:
   steer: [-1.0, 1.0]        # @brief Steering angle (-1.0 full left, 1.0 full right).
   throttle: [0.0, 1.0]      # @brief Throttle input (0.0 none, 1.0 maximum).
   brake: [0.0, 1.0]         # @brief Brake input (0.0 none, 1.0 full braking).
-
-# ----------------------------------------------------------------------------- 
-# @section render Render Settings
-# @brief Defines the rendering mode for the environment.
-# -----------------------------------------------------------------------------
-render:
-  mode: human                   # @brief Rendering mode: 'human' (display GUI) or 'rgb_array' (return frame).
 
 # -----------------------------------------------------------------------------
 # @section risk Risk Module Settings
@@ -76,3 +78,17 @@ risk:
     vehicle: 1.0                # @brief Weight for vehicle agents.
     walker: 2.5                 # @brief Weight for pedestrian agents.
     cyclist: 1.8                # @brief Weight for cyclist agents.
+
+# -----------------------------------------------------------------------------
+# @section ppo Proximal Policy Optimisation (PPO) settings
+# @brief Hyperparameters for training the reinforcement learning agent.
+# -----------------------------------------------------------------------------
+ppo:
+  gamma: 0.99
+  gae_lambda: 0.95
+  clip_ratio: 0.2
+  lr_actor: 3e-4
+  lr_critic: 3e-4
+  batch_size: 64
+  rollout_steps: 2048
+  epochs: 10

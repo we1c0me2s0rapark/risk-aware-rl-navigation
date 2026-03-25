@@ -132,6 +132,7 @@ class RiskModule:
 
             # Step 2a: Euclidean distance (metres).
             dist = np.hypot(agent['x'] - ego['x'], agent['y'] - ego['y'])
+            dist_norm = dist / self.radius # [0, 1]
 
             # Step 2b: One-hot category vector [vehicle, walker, cyclist].
             # Unknown categories default to vehicle (index 0).
