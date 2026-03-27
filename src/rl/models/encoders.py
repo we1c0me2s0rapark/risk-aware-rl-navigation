@@ -106,29 +106,30 @@ class ObservationEncoder(nn.Module):
             lidar: torch.Tensor = None,
             risk_features: torch.Tensor = None
         ) -> torch.Tensor:
-        """
-        @brief Forward pass to encode multi-modal observations.
+        
+        # 1. Camera Branch (e.g. [B, 128])
+        cam_feat = self.camera_fc(self.camera_cnn(camera))
+        feats = [cam_feat]
 
-        @param camera torch.Tensor Camera images of shape [B, C, H, W]
-        @param ego_state torch.Tensor Ego state features of shape [B, ego_state_dim]
-        @param lidar torch.Tensor Optional LiDAR input of shape [B, C, H, W]
-        @param risk_features torch.Tensor Optional risk features of shape [B, risk_feature_dim]
-        @return torch.Tensor Latent vector of shape [B, latent_dim]
-
-        @note LiDAR and risk features are only used if corresponding flags are enabled.
-        """
-        # Encode camera features
-        feats = [self.camera_fc(self.camera_cnn(camera))]
-
-        # Encode LiDAR features if enabled and provided
+        # 2. LiDAR Branch (e.g. [B, 64])
         if self.use_lidar and lidar is not None:
-            feats.append(self.lidar_fc(self.lidar_cnn(lidar)))
+            lidar_feat = self.lidar_fc(self.lidar_cnn(lidar))
+            feats.append(lidar_feat)
 
-        # Encode ego + risk features
-        mlp_input = torch.cat([ego_state, risk_features], dim=-1) if self.use_risk and risk_features is not None else ego_state
-        feats.append(self.mlp(mlp_input))
+        # 3. MLP Branch (Ego + Risk) 
+        # CRITICAL: Force flatten to [Batch, Features] to avoid dimension creep
+        ego_state = ego_state.view(ego_state.size(0), -1)
+        
+        if self.use_risk and risk_features is not None:
+            risk_features = risk_features.view(risk_features.size(0), -1)
+            mlp_input = torch.cat([ego_state, risk_features], dim=-1)
+        else:
+            mlp_input = ego_state
+            
+        # Push through MLP [B, 9] -> [B, 64]
+        mlp_feat = self.mlp(mlp_input)
+        feats.append(mlp_feat)
 
-        # Concatenate all features and project to latent
-        latent = self.fc_latent(torch.cat(feats, dim=-1))
-
-        return latent
+        # 4. Final Projection
+        combined = torch.cat(feats, dim=-1)
+        return self.fc_latent(combined)

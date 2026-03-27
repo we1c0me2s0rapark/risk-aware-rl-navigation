@@ -10,17 +10,31 @@ import gym
 from gym import spaces
 
 try:
+    # Allow importing from the src directory
+    sys.path.append(os.path.abspath(os.path.join(
+        os.path.dirname(__file__), ".."
+    )))
+    
     from carla_client.connection import connect_carla, configure_simulation
     from managers.actors import VehicleManager
     from managers.sensors import SensorManager
     from managers.utils.config_manager import load_config
+    from managers.utils.logger import Log
     from risk.module import RiskModule, AGENT_FEAT_DIM
     from env.reward import risk_aware_reward
 except ImportError as e:
-    print(f"[{__name__}] Error: {e}")
+    Log.error(__file__, e)
 
 @dataclass
 class FrameRecordState:
+    """
+    @brief Tracks frame recording state for logging or saving images.
+
+    @details
+    Stores the current index, the start time of the recording session,
+    and the directory path where frames will be saved.
+    """
+    
     index: int = 0
     start_time: datetime = field(default_factory=datetime.now)
     file_path: str = None
@@ -29,31 +43,28 @@ class CarlaEnv(gym.Env):
     """
     @brief OpenAI Gym environment for CARLA-based autonomous driving.
 
-    Provides a reinforcement learning interface integrating vehicle
-    control, multi-modal sensor observations (camera and LiDAR), and
-    simulation management.
-
     @details
+    Provides a reinforcement learning interface integrating:
+        - Vehicle control
+        - Multi-modal sensor observations (camera and LiDAR)
+        - Simulation management
+
     Observations:
         Flattened vector combining:
         - RGB camera image
         - LiDAR point cloud
+        - Risk features
 
     Actions:
-        Continuous control vector:
-        [steer, throttle, brake]
+        Continuous control vector [steer, throttle, brake].
     """
 
     metadata = {'render.modes': ['human', 'rgb_array']}
-    """ 
-    @brief Valid rendering modes for this Gym environment.
+    """
+    @brief Valid rendering modes.
 
-    Gym checks this metadata to verify supported render modes:
-    - 'human'    : display GUI via sensor manager / OpenCV
-    - 'rgb_array': return camera frame as a NumPy array
-
-    @note If a requested mode is not listed here, Gym wrappers
-        may skip rendering or raise a warning/error.
+    @note If a requested mode is not listed, Gym wrappers may skip rendering
+          or raise a warning/error.
     """
 
     def __init__(self):
@@ -91,18 +102,15 @@ class CarlaEnv(gym.Env):
         )
 
         # --- Observation space ---
-        train_cam = cam_config['train_resolution']
-        camera_dim = train_cam['x'] * train_cam['y'] * cam_config['channels']
+        camera_dim = cam_config['train_resolution']['x'] * cam_config['train_resolution']['y'] * cam_config['channels']
         lidar_dim = lidar_config['points'] * lidar_config['features_per_point']
-
-        obs_dim = camera_dim + lidar_dim
-
+        
         self.risk_module = RiskModule(self.config)
         risk_dim = self.risk_module.feature_dim
 
         self.observation_space = spaces.Box(
             low=0.0, high=1.0,
-            shape=(obs_dim + risk_dim,),
+            shape=(camera_dim + lidar_dim + risk_dim,),
             dtype=np.float32
         )
 
@@ -145,7 +153,11 @@ class CarlaEnv(gym.Env):
         Spawns a new ego vehicle, attaches sensors, and advances
         the simulation to generate the initial observation.
 
-        @return numpy.ndarray Initial observation vector.
+        @return dict Initial observation dictionary containing:
+            - 'camera': Camera vector
+            - 'lidar': LiDAR vector
+            - 'ego_state': Ego vehicle state
+            - 'risk_features': Risk module features
         """
 
         self._cleanup_actors()
@@ -187,15 +199,15 @@ class CarlaEnv(gym.Env):
         """
         @brief Execute one environment step.
 
-        Applies the given control to the vehicle, advances the
-        simulation, and returns observation, reward, and termination status.
+        Applies the given control to the vehicle, advances the simulation,
+        and returns observation, reward, and termination status.
 
-        @param action numpy.ndarray Control vector [steer, throttle, brake].
-        @return tuple (obs, reward, done, info) where:
-            - obs: numpy.ndarray Current observation vector.
-            - reward: float Reward for this step.
-            - done: bool Whether the episode has terminated.
-            - info: dict Additional information (e.g., collision count).
+        @param action numpy.ndarray Control vector [steer, throttle, brake]
+        @return tuple (obs, reward, done, info)
+            - obs: Current observation dictionary
+            - reward: Reward for this step
+            - done: Episode termination flag
+            - info: Additional info (e.g., collision count, distance to goal)
         """
 
         self.episode_length += 1
@@ -225,7 +237,7 @@ class CarlaEnv(gym.Env):
 
         info = {
             'collision': self._check_collision(),
-            'ttc_min':   float(self._risk_vec[4::AGENT_FEAT_DIM].min()),
+            'ttc_min': float(self._risk_vec[4::AGENT_FEAT_DIM].min()) if self._risk_vec is not None else 0.0,
             'goal_dist': self._prev_dist_to_goal,
             'baseline_reward': baseline_reward,
             'risk_reward': risk_reward,
@@ -233,7 +245,7 @@ class CarlaEnv(gym.Env):
 
         speed = np.sqrt(self._ego['vx']**2 + self._ego['vy']**2)
 
-        print(f"""[ Snapshot ]
+        Log.info(__file__, f"""SNAPSHOT
     Status: {'ALIVE 🟢' if self.vehicle.is_alive else 'DEAD 🔴'}
     Pose: x {self._ego['x']:.2f}, y {self._ego['y']:.2f}, z {self._ego['z']:.2f}, yaw {self._ego['yaw']}
     Speed: {speed} m/s
@@ -442,38 +454,70 @@ class CarlaEnv(gym.Env):
 
     def _get_observation(self):
         """
-        @brief Retrieve the current observation vector.
+        @brief Retrieve the current observation from the environment.
 
         @details
-        Combines camera, LiDAR, and risk feature data into a flattened
-        normalised vector. Uses cached risk vector if available to avoid
-        recomputation, otherwise computes a fresh risk vector based on
-        the current ego state and nearby actors.
+        Constructs a comprehensive observation dictionary combining:
+            - Camera data
+            - LiDAR data
+            - Ego vehicle state
+            - Risk module features
 
-        @return numpy.ndarray Observation vector, combining:
-            - Flattened camera frame
-            - Flattened LiDAR point cloud
-            - Risk feature vector
+        The ego vehicle state is computed if it is not already cached.
+        If risk features have not yet been calculated, the method queries
+        nearby actors and computes the risk vector using the RiskModule.
+
+        Sensor data is flattened and returned as float32 NumPy arrays.
+
+        @return dict Observation dictionary containing:
+            - 'camera' : Flattened NumPy array of camera data
+            - 'lidar' : Flattened NumPy array of LiDAR data
+            - 'ego_state' : NumPy array of ego vehicle state [x, y, z, vx, vy, yaw]
+            - 'risk_features' : NumPy array of computed risk features
         """
+        
+        # Ensure ego state exists
+        if self._ego is None:
+            self._ego = self._get_ego_state()  # <-- compute ego state if missing
 
+        ego = self._ego
+
+        # Sensor configuration
         lidar_config = self.config['sensors']['lidar']
-        cam_config = self.config['sensors']['camera']['train_resolution']
+        cam_config = self.config['sensors']['camera']
+        cam_res = cam_config['train_resolution']
+        cam_channels = cam_config['channels']
 
+        # Get sensor data
         sensor_obs = self.sensor_manager.get_observation(
-            camera_resolution=(cam_config['x'], cam_config['y']),
+            camera_resolution=(cam_res['x'], cam_res['y']),
             lidar_points=lidar_config['points']
-        )
+        ).astype(np.float32)
 
-        # Use the risk vector cached by step() if available,
-        # otherwise compute fresh (e.g. during reset() before step() is called).
-        if hasattr(self, '_risk_vec') and self._risk_vec is not None:
-            risk_vec = self._risk_vec
-        else:
-            ego = getattr(self, '_ego', None) or self._get_ego_state()
-            agents = getattr(self, '_agents', None) or self._get_nearby_actors()
-            risk_vec = self.risk_module.compute(ego, agents)
+        cam_dim = cam_res['x'] * cam_res['y'] * cam_channels
+        lidar_dim = lidar_config['points'] * lidar_config['features_per_point']
+        risk_dim = self.risk_module.feature_dim
 
-        return np.concatenate([sensor_obs, risk_vec.astype(np.float32)])
+        camera_obs = sensor_obs[:cam_dim]
+        lidar_obs = sensor_obs[cam_dim:cam_dim + lidar_dim]
+
+        if self._risk_vec is None:
+            self._agents = self._get_nearby_actors()
+            self._risk_vec = self.risk_module.compute(self._ego, self._agents)
+        risk_obs = self._risk_vec.astype(np.float32)
+
+        # Construct ego_state array
+        ego_state = np.array([
+            ego['x'], ego['y'], ego['z'],
+            ego['vx'], ego['vy'], ego['yaw']
+        ], dtype=np.float32)
+
+        return {
+            "camera": camera_obs,
+            "lidar": lidar_obs,
+            "ego_state": ego_state,
+            "risk_features": risk_obs
+        }
 
     def _compute_reward_baseline(self):
         """
@@ -580,7 +624,7 @@ class CarlaEnv(gym.Env):
             if self.sensor_manager.save_camera_frame(file_path=file_path):
                 self.frame_record_state.index += 1
         else:
-            print(f"Render mode {mode} not supported")
+            Log.warning(__file__, f"Render mode {mode} not supported")
 
     def close(self):
         """
@@ -592,4 +636,4 @@ class CarlaEnv(gym.Env):
         try:
             self._cleanup_actors()
         except Exception as e:
-            print(f"[{__name__}] Warning during cleanup: {e}")
+            Log.error(__file__, e)

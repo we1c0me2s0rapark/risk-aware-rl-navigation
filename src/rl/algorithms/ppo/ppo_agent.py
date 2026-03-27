@@ -1,109 +1,116 @@
+import os
+import sys
 import torch
-from torch import Tensor
-from torch.distributions import Normal
-from typing import Dict, Tuple
 
 try:
-    from common.policy import Policy
-    from models.actor import PPOActor
-    from models.critic import PPOCritic
-    from models.encoders import ObservationEncoder
+    # Allow importing from the src directory
+    sys.path.append(os.path.abspath(os.path.join(
+        os.path.dirname(__file__), "..", "..", ".."
+    )))
+    sys.path.append(os.path.abspath(os.path.join(
+        os.path.dirname(__file__), "..", "..", "..", "rl"
+    )))
+
+    from managers.utils.logger import Log
+    from algorithms.ppo.rollout_buffer import RolloutBuffer
+    from algorithms.ppo.ppo_trainer import PPOTrainer
+    from algorithms.ppo.ppo_policy import PPOPolicy
 except ImportError as e:
-    print(f"[{__name__}] Error: {e}")
+    Log.error(__file__, e)
 
 
-class PPOPolicy(Policy):
+class PPOAgent:
     """
-    @class PPOPolicy
-    @brief Proximal Policy Optimisation (PPO) policy with encoder, actor, and critic.
+    @class PPOAgent
+    @brief High-level PPO agent coordinating policy, buffer, and training.
 
-    This class implements a continuous-action PPO policy. Observations are first
-    encoded via a multi-modal encoder into a latent vector, which is then passed
-    through the actor to generate a Gaussian action distribution and the critic
-    to estimate state values.
+    This class orchestrates interaction between the environment and PPO
+    components, including action selection, experience storage, and policy updates.
+
+    @details
+    The agent integrates:
+      - `PPOPolicy` for action selection and evaluation.
+      - `RolloutBuffer` for storing experiences.
+      - `PPOTrainer` for performing the PPO update using stored experiences.
     """
 
-    def __init__(self, obs_config: dict, action_dim: int, device: str = "cpu"):
+    def __init__(self, obs_config, action_dim, device="cpu"):
         """
-        @brief Initialise the PPOPolicy.
+        @brief Initialise the PPO agent.
 
-        @param obs_config dict Configuration parameters for the ObservationEncoder
-        @param action_dim int Dimensionality of the action space
-        @param device str Torch device to use ('cpu' or 'cuda')
+        @param obs_config dict
+            Observation encoder configuration including shapes of camera, LiDAR,
+            ego-state, and risk features.
+        @param action_dim int
+            Dimensionality of the continuous action space (e.g., [steer, throttle, brake]).
+        @param device str
+            Torch device to use ('cpu' or 'cuda') for policy and buffer tensors.
         """
-        super().__init__()
 
-        self.device = torch.device(device)
+        self.device = device
 
-        # Multi-modal observation encoder
-        self.encoder = ObservationEncoder(**obs_config).to(self.device)
+        # --- Initialise policy ---
+        self.policy = PPOPolicy(obs_config, action_dim, device=device)
 
-        # Actor and critic networks
-        latent_dim = 256 # could be made configurable
-        self.actor = PPOActor(latent_dim=latent_dim, action_dim=action_dim, continuous=True).to(self.device)
-        self.critic = PPOCritic(latent_dim=latent_dim).to(self.device)
+        # --- Initialise rollout buffer ---
+        self.buffer = RolloutBuffer(
+            buffer_size=2048,
+            obs_shape=None,  # inferred from observations during storage
+            action_dim=action_dim,
+            device=torch.device(device)
+        )
 
-    def _encode(self, obs: Dict[str, Tensor]) -> Tensor:
+        # --- Initialise trainer ---
+        self.trainer = PPOTrainer(self.policy)
+
+    def act(self, obs):
         """
-        @brief Encode observations into latent representation.
+        @brief Select an action using the current policy.
 
-        Moves all observation tensors to the correct device before encoding.
+        @param obs dict
+            Current observation batch containing keys like 'camera', 'lidar',
+            'ego_state', and 'risk_features'.
 
-        @param obs dict Observations (e.g., camera, LiDAR, ego_state, risk_features)
-        @return torch.Tensor Latent vector representation of the input
+        @return tuple(torch.Tensor, torch.Tensor, torch.Tensor)
+            - action: Tensor of shape [batch_size, action_dim]
+            - log_prob: Tensor of log probabilities of actions [batch_size]
+            - value: Tensor of value estimates [batch_size]
         """
-        obs = {k: v.to(self.device) for k, v in obs.items()}
-        return self.encoder(**obs)
+        return self.policy.act(obs)
 
-    def _get_distribution(self, latent: Tensor) -> Normal:
+    def store(self, obs, action, log_prob, reward, done, value):
         """
-        @brief Create a Normal distribution from the actor's outputs.
+        @brief Store a transition in the rollout buffer.
 
-        @param latent torch.Tensor Latent representation from encoder
-        @return Normal Torch distribution representing action probabilities
+        @param obs dict
+            Observation corresponding to this timestep.
+        @param action torch.Tensor
+            Action taken by the agent.
+        @param log_prob torch.Tensor
+            Log probability of the selected action.
+        @param reward float
+            Reward received at this timestep.
+        @param done bool
+            Episode termination flag.
+        @param value torch.Tensor
+            Estimated value of the observation.
         """
-        mean, std = self.actor(latent)
-        return Normal(mean, std)
+        self.buffer.store(obs, action, log_prob, reward, done, value)
 
-    def act(self, obs: Dict[str, Tensor]) -> Tuple[Tensor, Tensor, Tensor]:
+    def update(self, last_obs, done):
         """
-        @brief Sample an action for environment interaction.
+        @brief Perform a PPO policy update using experiences in the buffer.
 
-        Encodes the observation, computes the action distribution, samples an
-        action, and evaluates its log probability and state value.
+        @param last_obs dict
+            Observation at the last timestep to compute advantages.
+        @param done bool
+            Indicates whether the episode ended at the last observation.
 
-        @param obs dict Current environment observation
-        @return action torch.Tensor Sampled action
-        @return log_prob torch.Tensor Log probability of the action
-        @return value torch.Tensor Estimated state value
+        @details
+        This method:
+          - Computes returns and advantages from stored transitions.
+          - Updates the policy using the PPO algorithm.
+          - Clears the buffer after the update.
         """
-        latent = self._encode(obs)
-        dist = self._get_distribution(latent)
-
-        action = dist.sample()
-        log_prob = dist.log_prob(action).sum(dim=-1)
-        value = self.critic(latent).squeeze(-1)
-
-        return action, log_prob, value
-
-    def evaluate(self, obs: Dict[str, Tensor], action: Tensor) -> Tuple[Tensor, Tensor, Tensor]:
-        """
-        @brief Evaluate a given action for PPO updates.
-
-        Computes the log probability, entropy, and state value for a provided
-        action, given the current observation.
-
-        @param obs dict Observations corresponding to the state
-        @param action torch.Tensor Action to evaluate
-        @return log_prob torch.Tensor Log probability of the action
-        @return entropy torch.Tensor Entropy of the action distribution
-        @return value torch.Tensor Estimated state value
-        """
-        latent = self._encode(obs)
-        dist = self._get_distribution(latent)
-
-        log_prob = dist.log_prob(action).sum(dim=-1)
-        entropy = dist.entropy().sum(dim=-1)
-        value = self.critic(latent).squeeze(-1)
-
-        return log_prob, entropy, value
+        self.trainer.update(self.buffer, last_obs, done)
+        self.buffer.clear()

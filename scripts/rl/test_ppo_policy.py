@@ -5,17 +5,33 @@ import torch
 try:
     # Allow importing from the src directory
     sys.path.append(os.path.abspath(os.path.join(
+        os.path.dirname(__file__), "..", "..", "src"
+    )))
+    sys.path.append(os.path.abspath(os.path.join(
         os.path.dirname(__file__), "..", "..", "src", "rl"
     )))
 
-    from algorithms.ppo.ppo_agent import PPOPolicy
+    from managers.utils.logger import Log
+    from algorithms.ppo.ppo_policy import PPOPolicy
 except ImportError as e:
-    print(f"[{__name__}] Error: {e}")
+    Log.error(__file__, e)
 
 def test_ppo_policy():
+    """
+    @brief Test the PPOPolicy class with synthetic observations.
+
+    This function performs a basic sanity check of the PPO policy by:
+    - Initialising the policy with a dummy observation configuration.
+    - Generating a batch of fake observations.
+    - Testing the `act()` method for action selection.
+    - Testing the `evaluate()` method for log-probability, entropy, and value outputs.
+
+    @note The function uses CPU by default; change `device` to 'cuda' to test on GPU.
+    """
+
     device = "cpu"
 
-    # Fake observation config (match encoder input)
+    # --- Dummy observation configuration ---
     obs_config = {
         "camera_shape": (3, 84, 84),
         "lidar_shape": (1, 64, 64),
@@ -26,13 +42,13 @@ def test_ppo_policy():
         "use_risk": True
     }
 
-    action_dim = 3  # steer, throttle, brake
+    action_dim = 3 # steer, throttle, brake
 
-    # Instantiate PPOPolicy
+    # --- Instantiate PPOPolicy ---
     policy = PPOPolicy(obs_config, action_dim, device=device)
-    policy.eval()  # set to evaluation mode
+    policy.eval() # set to evaluation mode
 
-    # Create dummy inputs
+    # --- Create dummy batch of observations ---
     batch_size = 2
     dummy_obs = {
         "camera": torch.randn(batch_size, *obs_config["camera_shape"]).to(device),
@@ -41,19 +57,27 @@ def test_ppo_policy():
         "risk_features": torch.randn(batch_size, obs_config["risk_feature_dim"]).to(device)
     }
 
-    # Test act()
+    # --- Test act() method ---
     action, log_prob, value = policy.act(dummy_obs)
-    print("act() outputs:")
-    print("Action shape:", action.shape)       # should be [batch_size, 3]
-    print("Log prob shape:", log_prob.shape)   # should be [batch_size]
-    print("Value shape:", value.shape)         # should be [batch_size, 1] or [batch_size]
 
-    # Test evaluate()
+    # --- Test evaluate() method ---
     log_prob2, entropy, value2 = policy.evaluate(dummy_obs, action)
-    print("\nevaluate() outputs:")
-    print("Log prob shape:", log_prob2.shape)
-    print("Entropy shape:", entropy.shape)
-    print("Value shape:", value2.shape)
+
+    Log.info(__file__, f"""
+    act() outputs:
+        Action shape: {action.shape}
+        Log prob shape: {log_prob.shape}
+        Value shape: {value.shape}
+
+    evaluate() outputs:
+        Log prob shape: {log_prob2.shape}
+        Entropy shape: {entropy.shape}
+        Value shape: {value2.shape}""")
 
 if __name__ == "__main__":
+    """
+    @brief Entry point for the test script.
+
+    Executes `test_ppo_policy()` if the script is run directly.
+    """
     test_ppo_policy()

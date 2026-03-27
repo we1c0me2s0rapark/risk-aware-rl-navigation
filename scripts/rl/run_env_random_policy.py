@@ -12,8 +12,9 @@ try:
     )))
 
     from env import CarlaEnv
+    from managers.utils.logger import Log
 except ImportError as e:
-    print(f"[{__name__}] Error: {e}")
+    Log.error(__file__, e)
 
 
 def main():
@@ -41,7 +42,6 @@ def main():
 
         # --- Reset environment ---
         obs = env.reset()
-        print("Initial observation shape:", obs.shape)
 
         done = False
         while not done:
@@ -58,19 +58,19 @@ def main():
 
             step_count += 1
 
-            print(f"""[ Risk ]
+            Log.info(__file__, f"""RISK
     Step {step_count:03d} | Done: {done} | Min TTC: {info.get('ttc_min', float('inf')):.2f}s""")
-            print(f"""[ Reward Comparison ]
+            Log.info(__file__, f"""REWARD COMPARISON
     Baseline: {info['baseline_reward']:.2f} | Risk-aware: {info['risk_reward']:.2f} | Collision: {info['collision']}""")
 
             # Slow down for human observation
             time.sleep(0.05)
 
     except Exception as e:
-        print(f"[{__file__}] Error: {e}")
+        Log.error(__file__, e)
 
     finally:
-        print(
+        Log.info(__file__, 
             f"🏳️  Episode finished after {step_count} steps; "
             f"baseline reward: {total_baseline:.2f}, "
             f"total reward: {total_reward:.2f}"
