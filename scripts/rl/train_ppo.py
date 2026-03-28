@@ -19,6 +19,7 @@ try:
 
     from gym_carla_env import CarlaEnv
     from managers.utils.logger import Log
+    from common.checkpoint import CheckpointManager
     from carla_client.utilities import is_q_pressed
     from algorithms.ppo.ppo_agent import PPOAgent
 except ImportError as e:
@@ -126,6 +127,10 @@ def main():
         # --- Initialise PPO agent ---
         agent = PPOAgent(obs_config, action_dim, device=device)
 
+        cp_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "checkpoints"))
+        checkpoint = CheckpointManager(cp_path)
+        rollout_count = checkpoint.load(agent) # returns 0 if no checkpoint
+
         obs = env.reset()
 
         while True:
@@ -184,10 +189,12 @@ def main():
                     f"baseline reward: {total_baseline:.2f}, "
                     f"total reward: {total_reward:.2f}"
                 )
-                last_obs_tensor = preprocess_obs(obs, env.config, device)
-                final_done = done  # last step's done flag
-                agent.update(last_obs=last_obs_tensor, done=final_done)
                 step_count = 0
+                last_obs_tensor = preprocess_obs(obs, env.config, device)
+                final_done = done # last step's done flag
+                agent.update(last_obs=last_obs_tensor, done=final_done)
+                rollout_count += 1
+                checkpoint.save(agent, rollout_count)
 
     except Exception as e:
         Log.error(__file__, e)

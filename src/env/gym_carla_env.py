@@ -246,8 +246,8 @@ class CarlaEnv(gym.Env):
         obs = self._get_observation()
 
         is_on_wrong_way = wrong_way_risk > WRONG_WAY_THRESHOLD
-        if is_on_wrong_way:
-            Log.warning(__file__, f"Wrong-way driving detected - risk: {wrong_way_risk:.2f}")
+        # if is_on_wrong_way:
+        #     Log.warning(__file__, f"Wrong-way driving detected - risk: {wrong_way_risk:.2f}")
         if self._check_collision():
             Log.warning(__file__, f"Collision detected with {len(self.collision_history)} events")
 
