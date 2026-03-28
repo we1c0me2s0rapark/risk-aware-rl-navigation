@@ -14,7 +14,7 @@ simulation:
   port: 2000                  # @brief TCP port to connect to the CARLA server.
   sync_mode: true             # @brief Enable synchronous simulation stepping.
   dt: 0.05                    # @brief Fixed time-step in seconds (simulation delta time).
-  max_episode_length: 100     # @brief Maximum number of steps per episode.
+  max_episode_length: 2000    # @brief Maximum number of steps per episode.
   goal_threshold: 5.0         # @brief Distance threshold (metres) for goal achievement.
 
 # ----------------------------------------------------------------------------- 

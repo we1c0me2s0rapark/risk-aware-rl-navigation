@@ -1,5 +1,7 @@
 import os
 import sys
+import tty
+import termios
 import torch
 import numpy as np
 
@@ -17,35 +19,34 @@ try:
 
     from gym_carla_env import CarlaEnv
     from managers.utils.logger import Log
-    from algorithms.ppo.ppo_policy import PPOPolicy
-    from algorithms.ppo.ppo_trainer import PPOTrainer
-    from algorithms.ppo.rollout_buffer import RolloutBuffer
+    from carla_client.utilities import is_q_pressed
+    from algorithms.ppo.ppo_agent import PPOAgent
 except ImportError as e:
     Log.error(__file__, e)
 
-def preprocess_obs(obs, config):
+
+def preprocess_obs(obs, config, device):
     """
-    @brief Preprocesses raw observations from CARLA environment for PPO input.
+    @brief Preprocess raw CARLA environment observations for PPO input.
 
-    @param[in] obs Dictionary containing raw sensor and state observations.
+    @param[in] obs Dictionary of raw sensor and state observations.
     @param[in] config Configuration dictionary specifying sensor properties.
+    @param[in] device Torch device for tensors.
 
-    @return Dictionary of batched torch tensors ready for policy input:
-        - 'camera': [1, channels, height, width] tensor
-        - 'lidar': [1, 1, height, width] tensor
-        - 'ego_state': [1, ego_state_dim] tensor
-        - 'risk_features': [1, risk_feature_dim] tensor
+    @return Dictionary of batched torch tensors suitable for policy input:
+        - 'camera': [1, channels, height, width]
+        - 'lidar': [1, 1, height, width]
+        - 'ego_state': [1, ego_state_dim]
+        - 'risk_features': [1, risk_feature_dim]
     """
     try:
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-        # --- Camera processing ---
+        # --- Camera ---
         cam_cfg = config['sensors']['camera']
         cam_res = cam_cfg['train_resolution']
         channels = cam_cfg['channels']
         camera = np.array(obs["camera"], dtype=np.float32).reshape(channels, cam_res['y'], cam_res['x'])
 
-        # --- LiDAR processing ---
+        # --- LiDAR ---
         lidar_cfg = config['sensors']['lidar']
         lidar_res = lidar_cfg['train_resolution']
         lidar_range = lidar_cfg['range']
@@ -58,11 +59,11 @@ def preprocess_obs(obs, config):
         lidar_bev[y_px[mask], x_px[mask]] = 1.0
         lidar = lidar_bev[np.newaxis, :, :]
 
-        # --- Ego vehicle state and risk features ---
+        # --- Ego state & risk features ---
         ego_state = np.array(obs["ego_state"], dtype=np.float32).flatten()
         risk_features = np.array(obs["risk_features"], dtype=np.float32).flatten()
 
-        # Returns batched tensors [1, ...] suitable for policy.act()
+        # --- Convert to batched torch tensors ---
         processed = {
             "camera": torch.tensor(camera, dtype=torch.float32, device=device).unsqueeze(0),
             "lidar": torch.tensor(lidar, dtype=torch.float32, device=device).unsqueeze(0),
@@ -74,66 +75,88 @@ def preprocess_obs(obs, config):
         Log.error(__file__, e)
         return None
 
+
 def main():
     """
-    @brief Main training loop for PPO policy in CARLA environment.
+    @brief PPO training loop for CARLA environment using fixed-size rollouts.
 
     @details
-    - Initialises the CARLA environment, PPO policy, PPO trainer, and rollout buffer.
-    - Collects rollouts for a fixed number of steps per episode.
-    - Updates the PPO policy after each rollout.
-    - Resets the environment when an episode terminates.
+    - Collects a fixed number of steps per rollout (e.g. 2048).
+    - Resets the environment when episodes terminate mid-rollout.
+    - Updates the PPO policy after each rollout using the last observation
+      and the correct 'done' flag for bootstrapping.
     """
+
+    # Preserve terminal configuration for later restoration
+    fd = sys.stdin.fileno()
+    old_settings = termios.tcgetattr(fd)
+    
+    step_count = 0
+    total_reward = 0.0
+    total_baseline = 0.0
+    done = False
+
+    action_dim = 3 # [steer, throttle, brake]
+    rollout_size = 2048 # fixed rollout size
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    # --- Initialise CARLA Gym environment ---
+    # --- Initialise environment ---
     env = CarlaEnv()
 
-    # --- Define action space dimension ---
-    action_dim = 3 # [steer, throttle, brake]
+    try:
+        # Enable non-blocking keyboard input
+        tty.setcbreak(fd)
 
-    # --- Observation configuration for PPO ---
-    obs_config = dict(
-        camera_shape=(3, 84, 84),
-        lidar_shape=(1, 64, 64),
-        ego_state_dim=6,
-        risk_feature_dim=55,
-    )
+        cam_config = env.config['sensors']['camera']
+        cam_res = cam_config['train_resolution']
+        cam_channels = cam_config['channels']
 
-    # --- Initialise PPO policy and trainer ---
-    policy = PPOPolicy(obs_config, action_dim, device)
-    trainer = PPOTrainer(policy)
+        lidar_config = env.config['sensors']['lidar']
+        lidar_res = lidar_config['train_resolution']
+        lidar_channels = lidar_config['channels']
 
-    # --- Initialise rollout buffer ---
-    buffer = RolloutBuffer(
-        buffer_size=2048,
-        obs_shape=None,
-        action_dim=action_dim,
-        device=device
-    )
+        # --- Observation configuration ---
+        obs_config = dict(
+            camera_shape=(cam_channels, cam_res['y'], cam_res['x']),
+            lidar_shape=(lidar_channels, lidar_res['y'], lidar_res['x']),
+            ego_state_dim=6,
+            risk_feature_dim=env.risk_module.feature_dim,
+        )
 
-    # --- Reset environment for initial observation ---
-    obs = env.reset()
+        # --- Initialise PPO agent ---
+        agent = PPOAgent(obs_config, action_dim, device=device)
 
-    # --- Main training loop ---
-    for episode in range(10):
-        for step in range(20):
-            # Preprocess observation → batched [1, ...] tensors for policy.act()
-            obs_tensor = preprocess_obs(obs, env.config)
+        obs = env.reset()
 
-            # Select action, log probability, and value from policy
-            action, log_prob, value = policy.act(obs_tensor)
+        while True:
+            if is_q_pressed():
+                raise RuntimeError("\n'q' pressed - Bye! 👋\n")
 
-            # Convert action to numpy array for Gym environment
-            # squeeze (1, 3) → (3,) so _apply_control can unpack [steer, throttle, brake]
+            obs_tensor = preprocess_obs(obs, env.config, device)
+
+            # Select action from policy
+            with torch.no_grad():
+                action, log_prob, value = agent.act(obs_tensor)
+
+            # Convert to numpy for Gym
             action_np = action.detach().cpu().numpy().squeeze(0)
 
             # Step environment
-            next_obs, reward, done, _ = env.step(action_np)
+            next_obs, reward, done, info = env.step(action_np, log=False)
 
-            # Store unbatched transitions in rollout buffer
-            # squeeze batch dim [1, ...] → [...] to prevent extra leading dimension
-            buffer.store(
+            env.render(save=False)
+
+            total_reward += reward
+            total_baseline += info.get('baseline_reward', 0.0)
+
+    #         Log.info(__file__, f"""RISK
+    # Step {step_count:03d} | Done: {done} | Min TTC: {info.get('ttc_min', float('inf')):.2f}s""")
+    #         Log.info(__file__, f"""REWARD COMPARISON
+    # Baseline: {info['baseline_reward']:.2f} | Risk-aware: {info['risk_reward']:.2f} | Collision: {info['collision']}""")
+
+
+            # Store in agent buffer
+            agent.store(
                 {k: v.squeeze(0) for k, v in obs_tensor.items()},
                 action.squeeze(0),
                 log_prob.squeeze(0),
@@ -143,21 +166,45 @@ def main():
             )
 
             obs = next_obs
+            step_count += 1
 
-            # Reset environment if episode terminates
+            # Reset environment if episode terminates mid-rollout
             if done:
+                Log.info(__file__, 
+                    f"🏳️  Rollout update completed after {step_count} steps; "
+                    f"baseline reward: {total_baseline:.2f}, "
+                    f"total reward: {total_reward:.2f}"
+                )
                 obs = env.reset()
 
-        # --- Update PPO policy after collecting rollout ---
-        # Preprocess last obs so PPO trainer can compute the bootstrap value
-        last_obs_tensor = preprocess_obs(obs, env.config)
-        trainer.update(buffer, last_obs=last_obs_tensor, done=False)
+            # --- Update PPO policy after fixed rollout ---
+            if step_count >= rollout_size:
+                Log.info(__file__, 
+                    f"🏳️  Rollout update completed after {step_count} steps; "
+                    f"baseline reward: {total_baseline:.2f}, "
+                    f"total reward: {total_reward:.2f}"
+                )
+                last_obs_tensor = preprocess_obs(obs, env.config, device)
+                final_done = done  # last step's done flag
+                agent.update(last_obs=last_obs_tensor, done=final_done)
+                step_count = 0
 
-        buffer.clear()
-        Log.check(__file__, f"Episode {episode} completed")
+    except Exception as e:
+        Log.error(__file__, e)
 
-    # --- Close environment and release resources ---
-    env.close()
+    finally:
+        # Restore terminal configuration
+        termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+        
+        Log.info(__file__, 
+            f"🏳️  Episode finished after {step_count} steps; "
+            f"baseline reward: {total_baseline:.2f}, "
+            f"total reward: {total_reward:.2f}"
+        )
+        
+        # --- Close environment safely ---
+        if env is not None:
+            env.close()
 
 if __name__ == "__main__":
     main()

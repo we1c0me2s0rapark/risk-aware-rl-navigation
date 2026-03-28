@@ -72,7 +72,7 @@ class VehicleManager:
                 desired_speed=0.0
             )
             self.vehicles.append(vehicle_state)
-            print(f"Spawned ego vehicle: {vehicle.type_id}")
+            # print(f"Spawned ego vehicle: {vehicle.type_id}")
             return vehicle
 
         return None

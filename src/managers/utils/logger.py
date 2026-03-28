@@ -1,3 +1,4 @@
+import traceback
 from pathlib import Path
 
 class Log:
@@ -26,7 +27,9 @@ class Log:
         @param message Exception message or object to log.
         """
         file_name = Log._get_file_name(file_path)
-        print(f"[ {file_name} ] 🚨 Error: {message}")
+        tb = traceback.extract_tb(message.__traceback__)
+        for frame in tb:
+            print(f"[ {file_name} ] 🚨 Error line: {frame.lineno}; message: {message}")
 
     @staticmethod
     def warning(file_path: str, message: str):
@@ -36,7 +39,7 @@ class Log:
         @param message Warning message to log.
         """
         file_name = Log._get_file_name(file_path)
-        print(f"[ {file_name} ] ⚠️ Warning: {message}")
+        print(f"[ {file_name} ] ⚠️  Warning: {message}")
 
     @staticmethod
     def check(file_path: str, message: str):
@@ -46,7 +49,7 @@ class Log:
         @param message Success message to log.
         """
         file_name = Log._get_file_name(file_path)
-        print(f"[ {file_name} ] {message} ✔️")
+        print(f"[ {file_name} ] {message}   ✔️")
 
     @staticmethod
     def info(file_path: str, message: str):

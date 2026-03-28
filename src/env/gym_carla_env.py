@@ -1,6 +1,8 @@
 import os
 import sys
+import math
 import random
+import torch
 import numpy as np
 from datetime import datetime
 from dataclasses import dataclass, field
@@ -178,14 +180,14 @@ class CarlaEnv(gym.Env):
         if self.vehicle is None:
             raise RuntimeError("Failed to spawn ego vehicle")
 
-        self._setup_sensors()
-
         self.episode_length = 0
         self.collision_history = []
 
         self._risk_vec = None
         self._ego = None
         self._agents = None
+
+        self._setup_sensors()
 
         self.world.tick()
 
@@ -195,7 +197,7 @@ class CarlaEnv(gym.Env):
 
         return self._get_observation()
 
-    def step(self, action):
+    def step(self, action, log=True):
         """
         @brief Execute one environment step.
 
@@ -215,10 +217,19 @@ class CarlaEnv(gym.Env):
         steer, throttle, brake = self._apply_control(action)
         self.world.tick()
 
+        # State updates
         self._ego = self._get_ego_state()
         self._agents = self._get_nearby_actors()
 
-        self._risk_vec = self.risk_module.compute(self._ego, self._agents)
+        # Risk and Reward logic
+        WRONG_WAY_THRESHOLD = 0.5 # risk > 0.5 (~>90°) counts as wrong-way
+        wrong_way_risk = self._compute_wrong_way_risk()
+
+        self._risk_vec = self.risk_module.compute(
+            self._ego,
+            self._agents,
+            wrong_way_risk
+        )
 
         baseline_reward = self._compute_reward_baseline()
         risk_reward = risk_aware_reward(
@@ -231,9 +242,21 @@ class CarlaEnv(gym.Env):
 
         reward = risk_reward # keep risk_reward as the main reward
 
+        # Construct observation
         obs = self._get_observation()
 
-        done = self._check_collision() or self._goal_reached() or self._timeout()
+        is_on_wrong_way = wrong_way_risk > WRONG_WAY_THRESHOLD
+        if is_on_wrong_way:
+            Log.warning(__file__, f"Wrong-way driving detected - risk: {wrong_way_risk:.2f}")
+        if self._check_collision():
+            Log.warning(__file__, f"Collision detected with {len(self.collision_history)} events")
+
+        # Decide done
+        done = (
+            self._check_collision() or
+            self._goal_reached() or
+            self._timeout()
+        )
 
         info = {
             'collision': self._check_collision(),
@@ -245,40 +268,58 @@ class CarlaEnv(gym.Env):
 
         speed = np.sqrt(self._ego['vx']**2 + self._ego['vy']**2)
 
-        Log.info(__file__, f"""SNAPSHOT
-    Status: {'ALIVE 🟢' if self.vehicle.is_alive else 'DEAD 🔴'}
-    Pose: x {self._ego['x']:.2f}, y {self._ego['y']:.2f}, z {self._ego['z']:.2f}, yaw {self._ego['yaw']}
-    Speed: {speed} m/s
-    Control: steer {steer}, throttle {throttle}, brake {brake}""")
+        if log:
+            Log.info(__file__, f"""SNAPSHOT
+        Status: {'ALIVE 🟢' if self.vehicle.is_alive else 'DEAD 🔴'}
+        Pose: x {self._ego['x']:.2f}, y {self._ego['y']:.2f}, z {self._ego['z']:.2f}, yaw {self._ego['yaw']}
+        Speed: {speed} m/s
+        Control: steer {steer}, throttle {throttle}, brake {brake}""")
 
         return obs, reward, done, info
 
     def _apply_control(self, action) -> list[float]:
         """
-        @brief Clip and apply a control action to the ego vehicle.
-        
+        @brief Convert PPO action to CARLA control and apply it.
+
         @details
-        The action is first clipped to the valid ranges defined by the
-        action_space. Throttle and brake are mutually exclusive: if throttle
-        exceeds 0.05, brake is set to 0, and vice versa. The resulting control
-        is applied to the CARLA vehicle actor.
+        Handles both NumPy arrays and torch.Tensors. Actions are squashed
+        using tanh to ensure valid ranges:
+            - steer ∈ [-1, 1]
+            - throttle ∈ [0, 1]
+            - brake ∈ [0, 1]
 
-        @param action numpy.ndarray Control vector [steer, throttle, brake].
-        @return list[float] Applied control values [steer, throttle, brake].
+        Throttle and brake are mutually exclusive.
+
+        @param action torch.Tensor | numpy.ndarray Raw action [steer, throttle, brake]
+        @return list[float] Applied control values [steer, throttle, brake]
         """
-        steer, throttle, brake = np.clip(
-            action,
-            self.action_space.low,
-            self.action_space.high
-        )
 
-        if throttle > 0.05: brake = 0.0
-        elif brake > 0.05: throttle = 0.0
+        # --- Convert to numpy ---
+        if isinstance(action, torch.Tensor):
+            action = action.detach().cpu().numpy()
 
+        # If batch dimension exists → take first element
+        if action.ndim > 1:
+            action = action[0]
+
+        # --- Squash to valid range ---
+        action = np.tanh(action)
+
+        steer = float(action[0])                # [-1, 1]
+        throttle = float((action[1] + 1) / 2)   # [0, 1]
+        brake = float((action[2] + 1) / 2)      # [0, 1]
+
+        # --- Enforce mutual exclusivity ---
+        if throttle > 0.05:
+            brake = 0.0
+        elif brake > 0.05:
+            throttle = 0.0
+
+        # --- Apply control ---
         self.vehicle.apply_control(carla.VehicleControl(
-            steer=float(steer),
-            throttle=float(throttle),
-            brake=float(brake)
+            steer=steer,
+            throttle=throttle,
+            brake=brake
         ))
 
         return steer, throttle, brake
@@ -296,6 +337,39 @@ class CarlaEnv(gym.Env):
         """
 
         return len(self.collision_history) > 0
+
+    def _is_driving_wrong_way(self) -> bool:
+        """
+        Returns True if ego is driving opposite to the lane direction.
+        """
+        vehicle_loc = self.vehicle.get_location()
+        vehicle_yaw = math.radians(self.vehicle.get_transform().rotation.yaw)
+
+        # Get closest waypoint
+        waypoint = self.world.get_map().get_waypoint(vehicle_loc)
+        lane_vector = waypoint.transform.get_forward_vector()
+        lane_yaw = math.atan2(lane_vector.y, lane_vector.x)
+
+        # Compute angle difference
+        angle_diff = abs((vehicle_yaw - lane_yaw + math.pi) % (2 * math.pi) - math.pi)
+        # If angle difference > 90 degrees, vehicle is mostly reversed
+        return angle_diff > math.pi / 2
+
+    def _compute_wrong_way_risk(self) -> float:
+        """
+        Returns a risk value [0,1] for driving against lane direction.
+        0 = correct direction, 1 = fully reversed
+        """
+        vehicle_loc = self.vehicle.get_location()
+        vehicle_yaw = math.radians(self.vehicle.get_transform().rotation.yaw)
+        
+        waypoint = self.world.get_map().get_waypoint(vehicle_loc)
+        lane_vector = waypoint.transform.get_forward_vector()
+        lane_yaw = math.atan2(lane_vector.y, lane_vector.x)
+
+        angle_diff = abs((vehicle_yaw - lane_yaw + math.pi) % (2*math.pi) - math.pi)
+        risk = min(1.0, angle_diff / math.pi) # normalized 0–1
+        return risk
 
     def _compute_progress(self) -> float:
         """
@@ -504,6 +578,7 @@ class CarlaEnv(gym.Env):
         if self._risk_vec is None:
             self._agents = self._get_nearby_actors()
             self._risk_vec = self.risk_module.compute(self._ego, self._agents)
+
         risk_obs = self._risk_vec.astype(np.float32)
 
         # Construct ego_state array
