@@ -7,9 +7,10 @@ class ObservationEncoder(nn.Module):
     @class ObservationEncoder
     @brief Encodes multi-modal observations into a latent vector.
 
-    This module takes camera images, LiDAR data, ego state, and optional risk features,
-    processes them through separate branches (CNNs for visual and LiDAR inputs, MLP for
-    ego/risk features), and projects the concatenated features into a latent representation.
+    This module processes camera images, LiDAR data, ego state, and optional risk
+    features through separate branches (CNNs for visual and LiDAR inputs, MLP for
+    ego and risk features) and projects the concatenated features into a latent
+    representation suitable for downstream policy networks.
 
     @note LiDAR and risk features are optional and can be enabled or disabled via flags.
     """
@@ -25,16 +26,17 @@ class ObservationEncoder(nn.Module):
         use_risk=True
     ):
         """
-        @brief Initialises the ObservationEncoder module.
+        @brief Initialise the ObservationEncoder module.
 
         @param camera_shape Tuple[int, int, int] Shape of camera input (C, H, W)
         @param lidar_shape Tuple[int, int, int] Shape of LiDAR input (C, H, W)
         @param ego_state_dim int Dimension of ego state features
         @param risk_feature_dim int Dimension of risk features
         @param latent_dim int Dimension of output latent vector
-        @param use_lidar bool Whether to include LiDAR input
-        @param use_risk bool Whether to include risk features
+        @param use_lidar bool Whether to include LiDAR input branch
+        @param use_risk bool Whether to include risk feature branch
         """
+
         super().__init__()
 
         self.use_lidar = use_lidar
@@ -106,6 +108,15 @@ class ObservationEncoder(nn.Module):
             lidar: torch.Tensor = None,
             risk_features: torch.Tensor = None
         ) -> torch.Tensor:
+        """
+        @brief Forward pass through the ObservationEncoder.
+
+        @param camera Tensor Camera images [B, C, H, W]
+        @param ego_state Tensor Ego vehicle state [B, ego_state_dim]
+        @param lidar Tensor Optional LiDAR data [B, C, H, W]
+        @param risk_features Tensor Optional risk features [B, risk_feature_dim]
+        @return torch.Tensor Latent representation [B, latent_dim]
+        """
         
         # 1. Camera Branch (e.g. [B, 128])
         cam_feat = self.camera_fc(self.camera_cnn(camera))
@@ -126,7 +137,6 @@ class ObservationEncoder(nn.Module):
         else:
             mlp_input = ego_state
             
-        # Push through MLP [B, 9] -> [B, 64]
         mlp_feat = self.mlp(mlp_input)
         feats.append(mlp_feat)
 

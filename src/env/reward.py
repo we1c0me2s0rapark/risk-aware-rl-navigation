@@ -1,123 +1,133 @@
 import numpy as np
 
 # Feature slot width — must match AGENT_FEAT_DIM in risk/module.py.
-#   [ dist | cat_onehot | ttc | risk | rel_v ]
-#     (1)      (3)       (1)   (1)    (5)     = 11
+#
+# Layout per agent:
+#   [ dist | category_one_hot | ttc | risk | relative_velocity ]
+#     (1)         (3)           (1)   (1)          (5)          = 11
+#
+# @note
+# Indices below refer to positions within a single agent feature block.
+
 _FEAT_DIM = 11
-_TTC_IDX  = 4   # index of TTC within one agent slot
-_RISK_IDX = 5   # index of risk score within one agent slot
+_TTC_IDX  = 4       # @brief Index of time-to-collision (TTC) within one agent feature block.
+_RISK_IDX = 5       # @brief Index of risk score within one agent feature block.
 
-def baseline_reward(ego: dict, collision: bool, goal_progress: float) -> float:
+def baseline_reward(
+    reward_config: dict,
+    ego: dict,
+    collision: bool,
+    goal_progress: float,
+    wp_dx: float = 0.0,
+    wp_dy: float = 0.0,
+    wrong_way_risk: float = 0.0,
+) -> float:
     """
-    @brief Compute the baseline reward for the current timestep.
-
-    @details
-    A simple reward signal that encourages goal-directed progress
-    whilst penalising collisions and discouraging lingering.
-
+    Compute the baseline reward signal.
+    
     Components:
-        + goal_progress   : metres closed toward the destination this step.
-                            Positive if approaching, negative if retreating.
-        - 200.0           : large one-off collision penalty.
-        - 0.01            : small time penalty per step to discourage
-                            the agent from idling or taking unnecessarily
-                            long routes.
+        - Progress towards the goal (metres)
+        - Heading alignment with waypoint vector
+        - Wrong-way penalty (scaled by reward_config['wrong_way_penalty'])
+        - Forward speed reward (capped, scaled)
+        - Collision penalty (reward_config['collision_penalty'])
+        - Small per-step time penalty (reward_config['time_penalty'])
 
-    @param ego           Dict with ego state (unused here, reserved for
-                         future shaping terms such as speed or heading error).
-    @param collision     True if a collision was recorded this step.
-    @param goal_progress Distance closed toward goal this step (metres).
-    @return float Baseline reward value.
+    Args:
+        reward_config: dict containing all reward scaling constants
+        ego: dict with ego vehicle state ('vx', 'vy', 'yaw')
+        collision: bool, True if collision occurred
+        goal_progress: float, distance progressed toward goal (metres)
+        wp_dx: float, x-component of normalized waypoint direction
+        wp_dy: float, y-component of normalized waypoint direction
+        wrong_way_risk: float, in [0,1], 1 = fully against lane
+
+    Returns:
+        Baseline reward (float)
     """
 
-    # -------------------------------------------------------------------------
-    # Progress reward.
-    #
-    #   Directly rewards closing the distance to the destination.
-    #   Scale factor 1.0 keeps units in metres per step, which is
-    #   interpretable and easy to tune against the penalty terms.
-    # -------------------------------------------------------------------------
-    r = goal_progress * 1.0
+    # Progress reward
+    r = goal_progress * reward_config['goal_progress_scale']
+
+    # Heading alignment
+    heading_vec = np.array([np.cos(ego['yaw']), np.sin(ego['yaw'])])
+    wp_vec = np.array([wp_dx, wp_dy])
+    alignment = float(np.dot(heading_vec, wp_vec))
+    r += alignment * reward_config['heading_alignment_scale']
 
     # -------------------------------------------------------------------------
-    # Collision penalty.
+    # Wrong-way penalty.
     #
-    #   Large negative reward to strongly discourage any collision.
-    #   Applied once per step whilst the collision flag is set — the
-    #   episode typically terminates immediately after, so this fires once.
+    #   Applies a continuous penalty for travelling against the lane direction.
+    #   The value is scaled by wrong_way_risk ∈ [0, 1], where:
+    #       0 → correct direction
+    #       1 → fully reversed
+    #
+    #   This provides a persistent corrective signal rather than a single
+    #   terminal penalty.
     # -------------------------------------------------------------------------
-    if collision:
-        r -= 200.0
+    r -= wrong_way_risk * reward_config['wrong_way_penalty']
 
     # -------------------------------------------------------------------------
-    # Time penalty.
+    # Speed reward (m/s).
     #
-    #   Small per-step cost to discourage the agent from idling or taking
-    #   unnecessarily long paths to the goal. Acts as a soft pressure
-    #   toward efficiency without overwhelming the progress signal.
+    #   Provides a small incentive for maintaining forward motion.
+    #   The reward is capped to discourage excessive or unsafe speeds.
     # -------------------------------------------------------------------------
-    r -= 0.01
+    speed = np.sqrt(ego['vx']**2 + ego['vy']**2)
+    r += min(speed, reward_config['speed_cap']) * reward_config['speed_reward_scale']
+
+    # Collision penalty
+    if collision: r -= reward_config['collision_penalty']
+
+    # Time penalty per step
+    r -= reward_config['time_penalty']
 
     return r
 
-def risk_aware_reward(ego: dict, collision: bool, goal_progress: float, risk_features: np.ndarray, top_k: int = 5) -> float:
+
+def risk_aware_reward(
+    reward_config: dict,
+    ego: dict,
+    collision: bool,
+    goal_progress: float,
+    risk_features: np.ndarray,
+    top_k: int = 5,
+    wp_dx: float = 0.0,
+    wp_dy: float = 0.0,
+    wrong_way_risk: float = 0.0,
+) -> float:
     """
-    @brief Compute the risk-aware reward for the current timestep.
+    Compute risk-aware reward signal.
 
-    @details
-    Extends the baseline reward with a per-agent TTC penalty that
-    discourages the agent from entering high-risk proximity to nearby
-    agents. Only agents with imminent TTC (< 3s) incur a penalty,
-    avoiding noise from distant, low-risk agents.
+    Extends baseline reward by penalizing risky interactions with nearby agents:
+        - For each of the top-k nearest agents:
+            - If TTC < reward_config['ttc_threshold'], apply penalty
+            - Penalty = reward_config['ttc_penalty_scale'] * agent risk score
 
-    Risk penalty per agent:
-        penalty = 5.0 × risk_score   (if ttc < 3.0s, else 0)
+    Args:
+        reward_config: dict of reward constants
+        ego: dict with ego state
+        collision: bool, True if collision occurred
+        goal_progress: float, distance progressed toward goal
+        risk_features: flattened np.ndarray of shape [num_agents * _FEAT_DIM]
+        top_k: int, number of nearest agents to consider
+        wp_dx: float, waypoint x-component
+        wp_dy: float, waypoint y-component
+        wrong_way_risk: float, in [0,1], 1 = fully against lane
 
-    Where risk_score ∈ [0, 1] is the category-scaled exponential
-    decay score from category_scaled_risk().
-
-    @param ego           Dict with ego state.
-    @param collision     True if a collision was recorded this step.
-    @param goal_progress Distance closed toward goal this step (metres).
-    @param risk_features Flat risk vector of shape (top_k * _FEAT_DIM,)
-                         produced by RiskModule.compute().
-    @param top_k         Number of agent slots in the risk vector.
-    @return float Risk-aware reward value.
+    Returns:
+        Risk-aware reward (float)
     """
+    
+    r = baseline_reward(reward_config, ego, collision, goal_progress, wp_dx, wp_dy, wrong_way_risk)
 
-    # Start from the baseline reward — progress, collision, time penalty.
-    r = baseline_reward(ego, collision, goal_progress)
-
-    # -------------------------------------------------------------------------
-    # Per-agent TTC penalty.
-    #
-    #   The risk vector is a flat array of top_k agent slots, each of
-    #   width _FEAT_DIM. Within each slot:
-    #     index 4 (_TTC_IDX)  : time-to-collision in seconds
-    #     index 5 (_RISK_IDX) : category-scaled risk score in [0, 1]
-    #
-    #   Layout for slot i:
-    #     risk_features[i * _FEAT_DIM + _TTC_IDX]   → ttc
-    #     risk_features[i * _FEAT_DIM + _RISK_IDX]  → risk_score
-    #
-    #   Only penalise agents with ttc < 3.0s (imminent risk threshold).
-    #   Agents beyond this are ignored to avoid penalising safe, distant
-    #   interactions and to keep the gradient signal focused.
-    #
-    #   Penalty scale 5.0 is tunable — it controls how strongly the agent
-    #   is pushed away from risky proximity relative to the progress reward.
-    #
-    #   Example:
-    #     walker at ttc=1.5s, risk_score=0.92 → penalty = 5.0 × 0.92 = 4.6
-    #     vehicle at ttc=4.0s, risk_score=0.26 → no penalty (ttc ≥ 3.0s)
-    # -------------------------------------------------------------------------
-
-    # Per-agent TTC penalty: penalise being close to any high-risk agent
-    for i in range(top_k):
+    max_agents = risk_features.size // _FEAT_DIM
+    for i in range(min(top_k, max_agents)):
         ttc = risk_features[i * _FEAT_DIM + _TTC_IDX]
         risk_score = risk_features[i * _FEAT_DIM + _RISK_IDX]
 
-        if ttc < 3.0: # only penalise imminent risk
-            r -= 5.0 * float(risk_score) # scaled penalty
+        if ttc < reward_config['ttc_threshold']:
+            r -= reward_config['ttc_penalty_scale'] * float(risk_score)
 
     return r

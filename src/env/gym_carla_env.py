@@ -17,6 +17,7 @@ try:
         os.path.dirname(__file__), ".."
     )))
     
+    from agents.navigation.global_route_planner import GlobalRoutePlanner
     from carla_client.connection import connect_carla, configure_simulation
     from managers.actors import VehicleManager
     from managers.sensors import SensorManager
@@ -63,10 +64,11 @@ class CarlaEnv(gym.Env):
 
     metadata = {'render.modes': ['human', 'rgb_array']}
     """
-    @brief Valid rendering modes.
+    @brief Supported rendering modes.
 
-    @note If a requested mode is not listed, Gym wrappers may skip rendering
-          or raise a warning/error.
+    @details
+    If a requested mode is not listed, Gym wrappers may skip rendering
+    or raise a warning or error.
     """
 
     def __init__(self):
@@ -152,14 +154,15 @@ class CarlaEnv(gym.Env):
         """
         @brief Reset the environment.
 
-        Spawns a new ego vehicle, attaches sensors, and advances
-        the simulation to generate the initial observation.
+        @details
+        Spawns a new ego vehicle, attaches sensors, and advances the
+        simulation to produce the initial observation.
 
-        @return dict Initial observation dictionary containing:
-            - 'camera': Camera vector
-            - 'lidar': LiDAR vector
-            - 'ego_state': Ego vehicle state
-            - 'risk_features': Risk module features
+        @return dict Initial observation containing:
+            - 'camera': camera data
+            - 'lidar': LiDAR data
+            - 'ego_state': ego vehicle state
+            - 'risk_features': risk feature vector
         """
 
         self._cleanup_actors()
@@ -192,24 +195,32 @@ class CarlaEnv(gym.Env):
         self.world.tick()
 
         spawn_points = self.world.get_map().get_spawn_points()
-        self._destination = random.choice(spawn_points).location
-        self._prev_dist_to_goal = self.vehicle.get_location().distance(self._destination)
+        start = self.vehicle.get_location()
+        end = random.choice(spawn_points).location
+        self._destination = end
+        self._waypoint_idx = 0
+
+        grp = GlobalRoutePlanner(self.world.get_map(), 2.0)
+        self._waypoints = grp.trace_route(start, end)
+        self._prev_dist_to_goal = start.distance(self._get_next_waypoint())
 
         return self._get_observation()
 
     def step(self, action, log=True):
         """
-        @brief Execute one environment step.
+        @brief Execute a single environment step.
 
-        Applies the given control to the vehicle, advances the simulation,
-        and returns observation, reward, and termination status.
+        @details
+        Applies the control action, advances the simulation, and computes
+        the resulting observation, reward, and termination condition.
 
-        @param action numpy.ndarray Control vector [steer, throttle, brake]
+        @param action numpy.ndarray Control input [steer, throttle, brake]
+        @param log bool Whether to log diagnostic information
         @return tuple (obs, reward, done, info)
-            - obs: Current observation dictionary
-            - reward: Reward for this step
-            - done: Episode termination flag
-            - info: Additional info (e.g., collision count, distance to goal)
+            - obs: observation dictionary
+            - reward: scalar reward
+            - done: termination flag
+            - info: additional diagnostic information
         """
 
         self.episode_length += 1
@@ -217,12 +228,21 @@ class CarlaEnv(gym.Env):
         steer, throttle, brake = self._apply_control(action)
         self.world.tick()
 
+        self._draw_waypoints()
+
         # State updates
         self._ego = self._get_ego_state()
         self._agents = self._get_nearby_actors()
 
+        # Waypoint direction
+        target = self._get_next_waypoint()
+        dx = target.x - self._ego['x']
+        dy = target.y - self._ego['y']
+        dist = max(np.sqrt(dx**2 + dy**2), 1e-6)
+        wp_dx, wp_dy = dx / dist, dy / dist
+
         # Risk and Reward logic
-        WRONG_WAY_THRESHOLD = 0.5 # risk > 0.5 (~>90°) counts as wrong-way
+        WRONG_WAY_THRESHOLD = 0.5
         wrong_way_risk = self._compute_wrong_way_risk()
 
         self._risk_vec = self.risk_module.compute(
@@ -233,25 +253,25 @@ class CarlaEnv(gym.Env):
 
         baseline_reward = self._compute_reward_baseline()
         risk_reward = risk_aware_reward(
+            self.config['risk']['reward'],
             self._ego,
             self._check_collision(),
             self._compute_progress(),
             self._risk_vec,
-            self.risk_module.top_k
+            self.risk_module.top_k,
+            wp_dx=wp_dx,
+            wp_dy=wp_dy,
+            wrong_way_risk=wrong_way_risk,
         )
 
-        reward = risk_reward # keep risk_reward as the main reward
+        reward = risk_reward
 
         # Construct observation
         obs = self._get_observation()
 
-        is_on_wrong_way = wrong_way_risk > WRONG_WAY_THRESHOLD
-        # if is_on_wrong_way:
-        #     Log.warning(__file__, f"Wrong-way driving detected - risk: {wrong_way_risk:.2f}")
         if self._check_collision():
             Log.warning(__file__, f"Collision detected with {len(self.collision_history)} events")
 
-        # Decide done
         done = (
             self._check_collision() or
             self._goal_reached() or
@@ -260,10 +280,13 @@ class CarlaEnv(gym.Env):
 
         info = {
             'collision': self._check_collision(),
+            'goal_reached': self._goal_reached(),
             'ttc_min': float(self._risk_vec[4::AGENT_FEAT_DIM].min()) if self._risk_vec is not None else 0.0,
             'goal_dist': self._prev_dist_to_goal,
             'baseline_reward': baseline_reward,
             'risk_reward': risk_reward,
+            'wp_idx': self._waypoint_idx,
+            'wp_total': len(self._waypoints),
         }
 
         speed = np.sqrt(self._ego['vx']**2 + self._ego['vy']**2)
@@ -273,24 +296,25 @@ class CarlaEnv(gym.Env):
         Status: {'ALIVE 🟢' if self.vehicle.is_alive else 'DEAD 🔴'}
         Pose: x {self._ego['x']:.2f}, y {self._ego['y']:.2f}, z {self._ego['z']:.2f}, yaw {self._ego['yaw']}
         Speed: {speed} m/s
-        Control: steer {steer}, throttle {throttle}, brake {brake}""")
+        Control: steer {steer}, throttle {throttle}, brake {brake}
+        Waypoint: {self._waypoint_idx}/{len(self._waypoints)}""")
 
         return obs, reward, done, info
-
+        
     def _apply_control(self, action) -> list[float]:
         """
-        @brief Convert PPO action to CARLA control and apply it.
+        @brief Convert the policy action into CARLA control commands.
 
         @details
-        Handles both NumPy arrays and torch.Tensors. Actions are squashed
-        using tanh to ensure valid ranges:
+        Accepts both NumPy arrays and torch tensors. Actions are squashed
+        using tanh to enforce valid ranges:
             - steer ∈ [-1, 1]
             - throttle ∈ [0, 1]
             - brake ∈ [0, 1]
 
-        Throttle and brake are mutually exclusive.
+        Throttle and brake are treated as mutually exclusive.
 
-        @param action torch.Tensor | numpy.ndarray Raw action [steer, throttle, brake]
+        @param action torch.Tensor | numpy.ndarray Raw action input
         @return list[float] Applied control values [steer, throttle, brake]
         """
 
@@ -322,6 +346,8 @@ class CarlaEnv(gym.Env):
             brake=brake
         ))
 
+        # Log.info(__file__, f"raw action: {action}, throttle: {throttle:.3f}, brake: {brake:.3f}")
+
         return steer, throttle, brake
 
     def _check_collision(self) -> bool:
@@ -338,28 +364,18 @@ class CarlaEnv(gym.Env):
 
         return len(self.collision_history) > 0
 
-    def _is_driving_wrong_way(self) -> bool:
-        """
-        Returns True if ego is driving opposite to the lane direction.
-        """
-        vehicle_loc = self.vehicle.get_location()
-        vehicle_yaw = math.radians(self.vehicle.get_transform().rotation.yaw)
-
-        # Get closest waypoint
-        waypoint = self.world.get_map().get_waypoint(vehicle_loc)
-        lane_vector = waypoint.transform.get_forward_vector()
-        lane_yaw = math.atan2(lane_vector.y, lane_vector.x)
-
-        # Compute angle difference
-        angle_diff = abs((vehicle_yaw - lane_yaw + math.pi) % (2 * math.pi) - math.pi)
-        # If angle difference > 90 degrees, vehicle is mostly reversed
-        return angle_diff > math.pi / 2
-
     def _compute_wrong_way_risk(self) -> float:
         """
-        Returns a risk value [0,1] for driving against lane direction.
-        0 = correct direction, 1 = fully reversed
+        @brief Compute a risk score for travelling against lane direction.
+
+        @details
+        The score is normalised to the range [0, 1], where:
+            - 0 indicates correct alignment with the lane
+            - 1 indicates full reversal
+
+        @return float Wrong-way risk value
         """
+
         vehicle_loc = self.vehicle.get_location()
         vehicle_yaw = math.radians(self.vehicle.get_transform().rotation.yaw)
         
@@ -368,7 +384,7 @@ class CarlaEnv(gym.Env):
         lane_yaw = math.atan2(lane_vector.y, lane_vector.x)
 
         angle_diff = abs((vehicle_yaw - lane_yaw + math.pi) % (2*math.pi) - math.pi)
-        risk = min(1.0, angle_diff / math.pi) # normalized 0–1
+        risk = min(1.0, angle_diff / math.pi) # normalised [0, 1]
         return risk
 
     def _compute_progress(self) -> float:
@@ -386,14 +402,18 @@ class CarlaEnv(gym.Env):
         @return float Distance closed towards the goal in metres.
             Positive if approaching the destination, negative if moving away.
         """
-
-        if self._destination is None:
-            v = self.vehicle.get_velocity()
-            return float(np.sqrt(v.x**2 + v.y**2 + v.z**2) * self.config['simulation']['dt'])
-
-        current_dist = self.vehicle.get_location().distance(self._destination)
+        target = self._get_next_waypoint()
+        current_dist = self.vehicle.get_location().distance(target)
         progress = self._prev_dist_to_goal - current_dist
         self._prev_dist_to_goal = current_dist
+
+        # Advance waypoint if close enough
+        if current_dist < 2.0 and self._waypoint_idx < len(self._waypoints) - 1:
+            self._waypoint_idx += 1
+            self._prev_dist_to_goal = self.vehicle.get_location().distance(
+                self._get_next_waypoint()
+            )
+            return 5.0 # waypoint reached bonus, overrides step progress
 
         return float(progress)
 
@@ -430,6 +450,18 @@ class CarlaEnv(gym.Env):
         """
 
         return self.episode_length >= self.max_episode_length
+
+    def _get_next_waypoint(self):
+        """
+        @brief Retrieve the next target waypoint along the planned route.
+
+        @return carla.Location Location of the next waypoint, or the
+                            destination if the route is exhausted.
+        """
+
+        if self._waypoints and self._waypoint_idx < len(self._waypoints):
+            return self._waypoints[self._waypoint_idx][0].transform.location
+        return self._destination
 
     def _get_ego_state(self) -> dict:
         """
@@ -528,33 +560,25 @@ class CarlaEnv(gym.Env):
 
     def _get_observation(self):
         """
-        @brief Retrieve the current observation from the environment.
+        @brief Construct the current observation.
 
         @details
-        Constructs a comprehensive observation dictionary combining:
-            - Camera data
-            - LiDAR data
-            - Ego vehicle state
-            - Risk module features
+        Combines sensor data, ego state, and risk features into a structured
+        observation dictionary. Sensor outputs are flattened and returned as
+        float32 NumPy arrays.
 
-        The ego vehicle state is computed if it is not already cached.
-        If risk features have not yet been calculated, the method queries
-        nearby actors and computes the risk vector using the RiskModule.
+        If required, ego state and risk features are computed on demand.
 
-        Sensor data is flattened and returned as float32 NumPy arrays.
-
-        @return dict Observation dictionary containing:
-            - 'camera' : Flattened NumPy array of camera data
-            - 'lidar' : Flattened NumPy array of LiDAR data
-            - 'ego_state' : NumPy array of ego vehicle state [x, y, z, vx, vy, yaw]
-            - 'risk_features' : NumPy array of computed risk features
+        @return dict Observation containing:
+            - 'camera': flattened camera data
+            - 'lidar': flattened LiDAR data
+            - 'ego_state': ego state vector
+            - 'risk_features': risk feature vector
         """
         
         # Ensure ego state exists
         if self._ego is None:
             self._ego = self._get_ego_state()  # <-- compute ego state if missing
-
-        ego = self._ego
 
         # Sensor configuration
         lidar_config = self.config['sensors']['lidar']
@@ -581,10 +605,24 @@ class CarlaEnv(gym.Env):
 
         risk_obs = self._risk_vec.astype(np.float32)
 
-        # Construct ego_state array
+        # Next N waypoints as relative (dx, dy) from ego position
+        N_WAYPOINTS = self.config['risk']['waypoints_ahead']
+        waypoint_obs = []
+        for i in range(N_WAYPOINTS):
+            idx = self._waypoint_idx + i
+            if idx < len(self._waypoints):
+                wp_loc = self._waypoints[idx][0].transform.location
+                dx = wp_loc.x - self._ego['x']
+                dy = wp_loc.y - self._ego['y']
+                dist = max(np.sqrt(dx**2 + dy**2), 1e-6)
+                waypoint_obs.extend([dx / dist, dy / dist])
+            else:
+                waypoint_obs.extend([0.0, 0.0])  # pad if route ends
+
         ego_state = np.array([
-            ego['x'], ego['y'], ego['z'],
-            ego['vx'], ego['vy'], ego['yaw']
+            self._ego['x'], self._ego['y'], self._ego['z'],
+            self._ego['vx'], self._ego['vy'], self._ego['yaw'],
+            *waypoint_obs # 5 waypoints × 2 = 10 values
         ], dtype=np.float32)
 
         return {
@@ -596,13 +634,13 @@ class CarlaEnv(gym.Env):
 
     def _compute_reward_baseline(self):
         """
-        @brief Compute the reward for the current timestep.
+        @brief Compute a baseline reward signal.
 
-        Encourages forward motion whilst penalising:
-        - collisions
-        - excessive steering
+        @details
+        Encourages forward motion whilst penalising collisions and excessive
+        steering input.
 
-        @return float Reward value.
+        @return float Reward value
         """
 
         v = self.vehicle.get_velocity()
@@ -615,13 +653,13 @@ class CarlaEnv(gym.Env):
 
     def _is_done_baseline(self):
         """
-        @brief Check whether the episode has terminated.
+        @brief Determine whether the episode has terminated.
 
-        Termination occurs if:
-        - a collision is recorded
-        - the maximum episode length is reached
+        @details
+        Termination occurs if a collision is detected or the maximum episode
+        length is reached.
 
-        @return bool True if the episode is done, False otherwise.
+        @return bool True if the episode is complete, False otherwise
         """
 
         return (len(self.collision_history) > 0 or self.episode_length >= self.max_episode_length)
@@ -636,7 +674,7 @@ class CarlaEnv(gym.Env):
         range are read from the loaded configuration. Collision history is
         initialised and linked to the sensor manager for later queries.
 
-        @note The sensors must be attached after the ego vehicle has been spawned.
+        @note Sensors must be attached after the ego vehicle has been spawned.
         """
 
         lidar_config = self.config['sensors']['lidar']
@@ -671,18 +709,74 @@ class CarlaEnv(gym.Env):
         self.sensor_manager.destroy_sensors()
         self.collision_history = []
 
+    def _draw_waypoints(self):
+        """
+        @brief Visualise upcoming waypoints in the CARLA simulator.
+
+        @details
+        Colour scheme:
+            - Waypoints +0 to +5  : rainbow (red to indigo)
+            - Remaining waypoints : violet
+            - Destination         : red (larger marker)
+        """
+
+        debug = self.world.debug
+
+        rainbow = [
+            carla.Color(255, 0,   0  ), # red
+            carla.Color(255, 127, 0  ), # orange
+            carla.Color(255, 255, 0  ), # yellow
+            carla.Color(0,   255, 0  ), # green
+            carla.Color(0,   0,   255), # blue
+            carla.Color(75,  0,   130), # indigo
+        ]
+        violet = carla.Color(148, 0, 211)
+
+        total_waypoints_to_draw = 10
+
+        # Find the closest waypoint to the vehicle's current position
+        ego_loc = self.vehicle.get_location()
+        closest_idx = min(
+            range(self._waypoint_idx, min(self._waypoint_idx + 50, len(self._waypoints))),
+            key=lambda i: self._waypoints[i][0].transform.location.distance(ego_loc),
+            default=self._waypoint_idx
+        )
+
+        # Draw next N waypoints from closest
+        for i in range(total_waypoints_to_draw):
+            idx = closest_idx + i
+            if idx >= len(self._waypoints):
+                break
+            wp, _ = self._waypoints[idx]
+            colour = rainbow[i] if i < len(rainbow) else violet
+            debug.draw_point(
+                wp.transform.location + carla.Location(z=0.5),
+                size=0.1,
+                color=colour,
+                life_time=0.1,
+            )
+
+        # Draw destination as a bigger red marker
+        if self._destination is not None:
+            debug.draw_point(
+                self._destination + carla.Location(z=1.0),
+                size=0.2,
+                color=carla.Color(255, 0, 0),
+                life_time=0.1,
+            )
+
     def render(self, mode='human', save=False):
         """
         @brief Render the environment.
 
         @details
-        Modes:
-            - 'human': display GUI via sensor manager
-            - 'rgb_array': return the latest camera frame as a NumPy array
+        Supported modes:
+            - 'human': display via the sensor manager
+            - 'rgb_array': save or return camera frames
 
-        @param mode str Render mode ('human' or 'rgb_array').
-        @param save bool Whether to save the frame to disk (only relevant for 'rgb_array').
-        @return numpy.ndarray|None Camera frame if mode='rgb_array', otherwise None.
+        @param mode str Rendering mode
+        @param save bool Whether to save frames when using 'rgb_array'
+        @return numpy.ndarray|None Camera frame if applicable
         """
 
         render_mode = self.config.get('render', {}).get('mode', 'human')
@@ -703,9 +797,10 @@ class CarlaEnv(gym.Env):
 
     def close(self):
         """
-        @brief Close the environment and release all resources.
+        @brief Release all environment resources.
 
-        Safely destroys vehicle and sensor actors.
+        @details
+        Safely destroys the ego vehicle and all attached sensors.
         """
         
         try:

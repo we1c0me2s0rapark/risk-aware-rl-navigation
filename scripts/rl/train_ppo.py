@@ -120,7 +120,7 @@ def main():
         obs_config = dict(
             camera_shape=(cam_channels, cam_res['y'], cam_res['x']),
             lidar_shape=(lidar_channels, lidar_res['y'], lidar_res['x']),
-            ego_state_dim=6,
+            ego_state_dim=16, # 6 base + 10 waypoint values
             risk_feature_dim=env.risk_module.feature_dim,
         )
 
@@ -175,11 +175,23 @@ def main():
 
             # Reset environment if episode terminates mid-rollout
             if done:
-                Log.info(__file__, 
-                    f"🏳️  Rollout update completed after {step_count} steps; "
-                    f"baseline reward: {total_baseline:.2f}, "
-                    f"total reward: {total_reward:.2f}"
-                )
+                goal_reached = info.get('goal_reached', False)
+                collision = info.get('collision', False)
+
+                log_text = ""
+
+                if goal_reached: log_text += f"🎯 Goal reached after {step_count} steps; "
+                elif collision: log_text += f"💥 Collision after {step_count} steps; "
+                else: log_text += f"⏱️  Timeout after {step_count} steps; "
+
+                log_text += f"waypoints: {info['wp_idx']}/{info['wp_total']}; "
+                log_text += f"total reward: {total_reward:.2f}"
+
+                Log.info(__file__, log_text)
+
+                total_reward = 0.0 # reset per episode
+                total_baseline = 0.0 # reset per episode
+
                 obs = env.reset()
 
             # --- Update PPO policy after fixed rollout ---

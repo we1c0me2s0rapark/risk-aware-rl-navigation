@@ -5,29 +5,38 @@ from managers.utils.logger import Log
 class CheckpointManager:
     """
     @class CheckpointManager
-    @brief Manages saving and loading of PPO agent checkpoints.
+    @brief Handles saving and loading of PPO agent checkpoints.
 
-    Persists policy weights and optimiser state across training sessions,
-    allowing training to resume from the last saved rollout.
+    This class manages the persistence of the agent's neural network weights
+    and optimiser state, allowing training to be paused and resumed from the
+    last saved checkpoint.
     """
 
     def __init__(self, checkpoint_dir: str, filename: str = "ppo_checkpoint.pth"):
         """
-        @brief Initialise the CheckpointManager.
+        @brief Initialise the checkpoint manager.
 
-        @param checkpoint_dir str Directory in which to store checkpoint files.
-        @param filename str Name of the checkpoint file.
+        Ensures that the checkpoint directory exists.
+
+        @param checkpoint_dir Directory in which to store checkpoint files.
+        @param filename Name of the checkpoint file (default: "ppo_checkpoint.pth").
         """
+
         self.path = os.path.join(checkpoint_dir, filename)
         os.makedirs(checkpoint_dir, exist_ok=True)
 
     def save(self, agent, rollout_count: int):
         """
-        @brief Save agent state to disk.
+        @brief Save the agent's state to disk.
 
-        @param agent PPOAgent The agent whose state is to be saved.
-        @param rollout_count int Number of completed rollouts, stored for resumption.
+        Persists the policy, critic and encoder network weights, together
+        with the optimiser state. Also stores the number of completed rollouts
+        to allow training to resume.
+
+        @param agent The PPO agent whose state is to be saved.
+        @param rollout_count Number of completed rollouts.
         """
+
         torch.save({
             'rollout_count': rollout_count,
             'encoder':       agent.policy.encoder.state_dict(),
@@ -39,13 +48,18 @@ class CheckpointManager:
 
     def load(self, agent) -> int:
         """
-        @brief Load agent state from disk if a checkpoint exists.
+        @brief Load the agent's state from disk if a checkpoint exists.
 
-        @param agent PPOAgent The agent into which state will be loaded.
-        @return int Number of completed rollouts at the time of saving, or 0 if no checkpoint found.
+        Restores the encoder, actor, critic and optimiser states from the
+        checkpoint file. Returns the rollout count to resume training from.
+        If no checkpoint is found, returns 0.
+
+        @param agent The PPO agent into which the state will be loaded.
+        @return Number of completed rollouts at the time of saving, or 0 if no checkpoint exists.
         """
+        
         if not os.path.exists(self.path):
-            Log.info(__file__, "No checkpoint found — starting from scratch.")
+            Log.info(__file__, "No checkpoint found - starting from scratch.")
             return 0
 
         ckpt = torch.load(self.path, map_location=agent.device)
