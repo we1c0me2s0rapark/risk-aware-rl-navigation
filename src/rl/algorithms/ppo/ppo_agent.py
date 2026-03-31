@@ -78,7 +78,7 @@ class PPOAgent:
         """
         return self.policy.act(obs)
 
-    def store(self, obs, action, log_prob, reward, done, value):
+    def store(self, obs, action, log_prob, rewards, done, value):
         """
         @brief Store a transition in the rollout buffer.
 
@@ -88,14 +88,14 @@ class PPOAgent:
             Action taken by the agent.
         @param log_prob torch.Tensor
             Log probability of the selected action.
-        @param reward float
-            Reward received at this timestep.
+        @param rewards torch.Tensor
+            Tensor of rewards for each objective (shape [n_objectives]).
         @param done bool
             Episode termination flag.
         @param value torch.Tensor
             Estimated value of the observation.
         """
-        self.buffer.store(obs, action, log_prob, reward, done, value)
+        self.buffer.store(obs, action, log_prob, rewards, done, value)
 
     def update(self, last_obs, done):
         """

@@ -5,30 +5,29 @@ class RolloutBuffer:
     @class RolloutBuffer
     @brief Stores trajectories and computes returns/advantages for PPO.
 
+    @details
     This class collects observations, actions, log probabilities, rewards,
     done flags, and value estimates during rollout. It supports computing
     returns and advantages using Generalised Advantage Estimation (GAE)
     for policy optimisation.
 
-    @details
     - Handles variable-length episodes.
     - Automatically normalises advantages for stable learning.
     - Detaches actions, log_probs, and values to avoid unwanted gradient tracking.
     """
 
-    def __init__(self, buffer_size, obs_shape, action_dim, device):
+    def __init__(self, buffer_size: int, obs_shape, action_dim: int, device):
         """
         @brief Initialise the rollout buffer.
 
         @param buffer_size int Maximum number of timesteps to store.
-        @param obs_shape tuple or None Shape of observations (unused here, for future preallocation).
+        @param obs_shape tuple or None Shape of observations (reserved for future preallocation).
         @param action_dim int Number of action dimensions.
         @param device torch.device or str Device to store tensors ('cpu' or 'cuda').
         """
         self.device = device
         self.ptr = 0
         self.max_size = buffer_size
-
         self._init_storage()
 
     def _init_storage(self):
@@ -44,16 +43,17 @@ class RolloutBuffer:
         """
         @brief Clear the buffer and reset the pointer.
 
-        This is typically called after a PPO update to start a new rollout.
+        @details
+        Typically called after a PPO update to start a new rollout.
         """
         self.ptr = 0
         self._init_storage()
 
-    def store(self, obs, action, log_prob, reward, done, value):
+    def store(self, obs, action: torch.Tensor, log_prob: torch.Tensor, reward: float, done: bool, value: torch.Tensor):
         """
         @brief Store a single transition in the buffer.
 
-        @param obs dict Observation at current timestep.
+        @param obs dict Observation at the current timestep.
         @param action torch.Tensor Action taken.
         @param log_prob torch.Tensor Log probability of the action.
         @param reward float Reward received after taking the action.
@@ -67,46 +67,52 @@ class RolloutBuffer:
         self.obs.append(obs)
         self.actions.append(action.detach())
         self.log_probs.append(log_prob.detach())
-        self.rewards.append(torch.tensor(reward, device=self.device))
-        self.dones.append(torch.tensor(done, device=self.device))
+        self.rewards.append(torch.tensor(reward, dtype=torch.float32, device=self.device))
         self.values.append(value.detach())
+        self.dones.append(torch.tensor(done, dtype=torch.float32, device=self.device))
 
-    def compute_returns_advantages(self, gamma=0.99, lam=0.95, last_value=0):
+    def compute_returns_advantages(self, gamma: float = 0.99, lam: float = 0.95, last_value=0, objective_weights=None):
         """
-        @brief Compute returns and advantages for the stored trajectory using GAE.
+        @brief Compute returns and advantages for all timesteps in the buffer.
 
-        @param gamma float Discount factor for future rewards.
-        @param lam float Lambda parameter for GAE smoothing.
-        @param last_value torch.Tensor or float Bootstrapped value for final timestep (0 if done).
+        @param gamma float Discount factor.
+        @param lam float GAE lambda.
+        @param last_value torch.Tensor or float Value estimate for the final timestep (bootstrap).
+        @param objective_weights torch.Tensor Optional weighting per objective.
 
         @details
-        - Converts boolean done flags to float to allow arithmetic operations.
-        - Computes advantages using:
-          \f$ \delta_t = r_t + \gamma V_{t+1} (1 - done_t) - V_t \f$
-          \f$ A_t = \delta_t + \gamma \lambda (1 - done_t) A_{t+1} \f$
-        - Returns are computed as:
-          \f$ R_t = A_t + V_t \f$
-        - Advantages are normalised for numerical stability.
+        - Computes Generalised Advantage Estimation (GAE) per objective.
+        - Combines multiple objectives using learnable or provided weights.
+        - Advantages are normalised for stable policy optimisation.
         """
-        advantages = []
-        gae = 0
-        next_value = last_value
+        n_objectives = self.values[0].shape[-1]
+        T = len(self.rewards)
 
-        values = torch.stack(self.values).squeeze(-1)
+        advantages = torch.zeros(T, n_objectives, device=self.device)
+        gae = torch.zeros(n_objectives, device=self.device)
+        next_value = last_value \
+            if isinstance(last_value, torch.Tensor) \
+            else torch.zeros(n_objectives, device=self.device)
 
-        for step in reversed(range(len(self.rewards))):
-            # Ensure done flag is float to allow arithmetic
-            done_mask = self.dones[step].float()
-            delta = self.rewards[step] + gamma * next_value * (1.0 - done_mask) - self.values[step]
-            gae = delta + gamma * lam * (1.0 - done_mask) * gae
+        values = torch.stack(self.values)  # [T, n_objectives]
 
-            advantages.insert(0, gae)
-            next_value = self.values[step]
+        # Compute GAE backwards
+        for t in reversed(range(T)):
+            done_mask = self.dones[t].float()
+            delta = self.rewards[t] + gamma * next_value * (1 - done_mask) - values[t]
+            gae = delta + gamma * lam * (1 - done_mask) * gae
+            advantages[t] = gae
+            next_value = values[t]
 
-        returns = [adv + val for adv, val in zip(advantages, values)]
+        returns = advantages + values  # [T, n_objectives]
 
-        self.advantages = torch.stack(advantages).to(self.device)
-        self.returns = torch.stack(returns).to(self.device)
+        # Apply objective weights
+        if objective_weights is None:
+            objective_weights = torch.ones(n_objectives, device=self.device) / n_objectives
+        else:
+            objective_weights = objective_weights.to(self.device)
 
-        # normalise advantages
+        # Weighted sum of advantages per timestep, then normalise
+        self.advantages = (advantages * objective_weights).sum(dim=-1)  # [T]
+        self.returns = returns  # [T, n_objectives] - used for per-head critic loss
         self.advantages = (self.advantages - self.advantages.mean()) / (self.advantages.std() + 1e-8)

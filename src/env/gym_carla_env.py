@@ -24,7 +24,7 @@ try:
     from managers.utils.config_manager import load_config
     from managers.utils.logger import Log
     from risk.module import RiskModule, AGENT_FEAT_DIM
-    from env.reward import risk_aware_reward
+    from env.reward import decomposed_reward, baseline_reward
 except ImportError as e:
     Log.error(__file__, e)
 
@@ -251,8 +251,15 @@ class CarlaEnv(gym.Env):
             wrong_way_risk
         )
 
-        baseline_reward = self._compute_reward_baseline()
-        risk_reward = risk_aware_reward(
+        baseline_rewards = baseline_reward(
+            self.config['risk']['reward'],
+            self._ego,
+            self._check_collision(),
+            self._compute_progress(),
+            top_k=self.risk_module.top_k,
+        )
+
+        rewards = decomposed_reward(
             self.config['risk']['reward'],
             self._ego,
             self._check_collision(),
@@ -264,7 +271,7 @@ class CarlaEnv(gym.Env):
             wrong_way_risk=wrong_way_risk,
         )
 
-        reward = risk_reward
+        reward = rewards
 
         # Construct observation
         obs = self._get_observation()
@@ -283,8 +290,10 @@ class CarlaEnv(gym.Env):
             'goal_reached': self._goal_reached(),
             'ttc_min': float(self._risk_vec[4::AGENT_FEAT_DIM].min()) if self._risk_vec is not None else 0.0,
             'goal_dist': self._prev_dist_to_goal,
-            'baseline_reward': baseline_reward,
-            'risk_reward': risk_reward,
+            'baseline_reward': float(baseline_rewards.sum()),
+            'reward_navigation': rewards[0],
+            'reward_safety': rewards[1],
+            'reward_risk': rewards[2],
             'wp_idx': self._waypoint_idx,
             'wp_total': len(self._waypoints),
         }
@@ -631,25 +640,6 @@ class CarlaEnv(gym.Env):
             "ego_state": ego_state,
             "risk_features": risk_obs
         }
-
-    def _compute_reward_baseline(self):
-        """
-        @brief Compute a baseline reward signal.
-
-        @details
-        Encourages forward motion whilst penalising collisions and excessive
-        steering input.
-
-        @return float Reward value
-        """
-
-        v = self.vehicle.get_velocity()
-        speed = np.sqrt(v.x**2 + v.y**2 + v.z**2)
-        reward = speed * 0.05
-        if len(self.collision_history) > 0:
-            reward -= 10.0
-        reward -= abs(self.vehicle.get_control().steer) * 0.01
-        return reward
 
     def _is_done_baseline(self):
         """

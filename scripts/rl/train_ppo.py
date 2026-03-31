@@ -93,8 +93,8 @@ def main():
     old_settings = termios.tcgetattr(fd)
     
     step_count = 0
-    total_reward = 0.0
-    total_baseline = 0.0
+    total_reward = np.zeros(3)
+    total_baseline = np.zeros(3)
     done = False
 
     action_dim = 3 # [steer, throttle, brake]
@@ -162,12 +162,12 @@ def main():
 
             # Store in agent buffer
             agent.store(
-                {k: v.squeeze(0) for k, v in obs_tensor.items()},
-                action.squeeze(0),
-                log_prob.squeeze(0),
-                reward,
-                done,
-                value.squeeze(0)
+                obs={k: v.squeeze(0) for k, v in obs_tensor.items()},
+                action=action.squeeze(0),
+                log_prob=log_prob.squeeze(0),
+                rewards=torch.tensor(reward, dtype=torch.float32),
+                done=done,
+                value=value.squeeze(0), # now [n_objectives]
             )
 
             obs = next_obs
@@ -185,12 +185,17 @@ def main():
                 else: log_text += f"⏱️  Timeout after {step_count} steps; "
 
                 log_text += f"waypoints: {info['wp_idx']}/{info['wp_total']}; "
-                log_text += f"total reward: {total_reward:.2f}"
+                log_text += f"total: {total_reward.sum():.2f} "
+                log_text += f"[ "
+                log_text += f"nav: {total_reward[0]:.2f}, "
+                log_text += f"safety: {total_reward[1]:.2f}, "
+                log_text += f"risk: {total_reward[2]:.2f}"
+                log_text += f" ]"
 
                 Log.info(__file__, log_text)
 
-                total_reward = 0.0 # reset per episode
-                total_baseline = 0.0 # reset per episode
+                total_reward = np.zeros(3) # reset per episode
+                total_baseline = np.zeros(3) # reset per episode
 
                 obs = env.reset()
 
@@ -198,8 +203,9 @@ def main():
             if step_count >= rollout_size:
                 Log.info(__file__, 
                     f"🏳️  Rollout update completed after {step_count} steps; "
-                    f"baseline reward: {total_baseline:.2f}, "
-                    f"total reward: {total_reward:.2f}"
+                    f"nav: {total_reward[0]:.2f} | "
+                    f"safety: {total_reward[1]:.2f} | "
+                    f"risk: {total_reward[2]:.2f}"
                 )
                 step_count = 0
                 last_obs_tensor = preprocess_obs(obs, env.config, device)
@@ -216,9 +222,12 @@ def main():
         termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
         
         Log.info(__file__, 
-            f"🏳️  Episode finished after {step_count} steps; "
-            f"baseline reward: {total_baseline:.2f}, "
-            f"total reward: {total_reward:.2f}"
+            f"\n🏳️  Episode finished after {step_count} steps; rewards - "
+            f"baseline: {total_baseline.sum():.2f}\n"
+            f"total: {total_reward.sum():.2f}\n"
+            f"\t- nav {total_reward[0]:.2f}\n"
+            f"\t- safety {total_reward[1]:.2f}\n"
+            f"\t- risk {total_reward[2]:.2f}\n"
         )
         
         # --- Close environment safely ---

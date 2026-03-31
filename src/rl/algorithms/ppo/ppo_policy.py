@@ -93,7 +93,7 @@ class PPOPolicy(Policy):
 
         action = dist.sample()
         log_prob = dist.log_prob(action).sum(dim=-1)
-        value = self.critic(latent).squeeze(-1)
+        value = self.critic(latent)
 
         return action, log_prob, value
 
@@ -115,6 +115,6 @@ class PPOPolicy(Policy):
 
         log_prob = dist.log_prob(action).sum(dim=-1)
         entropy = dist.entropy().sum(dim=-1)
-        value = self.critic(latent).squeeze(-1)
+        value = self.critic(latent)
 
         return log_prob, entropy, value
