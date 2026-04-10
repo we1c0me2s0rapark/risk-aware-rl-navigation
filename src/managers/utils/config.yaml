@@ -7,32 +7,32 @@
 # =============================================================================
 
 # ----------------------------------------------------------------------------- 
-# @section simulation Simulation Settings
-# @brief Core simulation parameters controlling timing and execution behaviour.
+# @section simulation Simulation settings
+# @brief Core parameters controlling simulation timing and execution behaviour.
 # -----------------------------------------------------------------------------
 simulation:
-  port: 2000                  # @brief TCP port to connect to the CARLA server.
-  sync_mode: true             # @brief Enable synchronous simulation stepping.
-  dt: 0.05                    # @brief Fixed time-step in seconds (simulation delta time).
-  max_episode_length: 100     # @brief Maximum number of steps per episode.
-  goal_threshold: 5.0         # @brief Distance threshold (metres) for goal achievement.
+  port: 2000                  # @brief TCP port used to connect to the CARLA server.
+  sync_mode: true             # @brief Enables synchronous simulation stepping mode.
+  dt: 0.05                    # @brief Fixed time step in seconds (simulation delta time).
+  max_episode_length: 2000    # @brief Maximum number of steps in an episode.
+  goal_threshold: 5.0         # @brief Distance threshold (metres) for reaching the goal.
 
 # ----------------------------------------------------------------------------- 
-# @section render Render Settings
-# @brief Defines the rendering mode for the environment.
+# @section render Rendering settings
+# @brief Defines the rendering mode of the environment.
 # -----------------------------------------------------------------------------
 render:
-  mode: human                   # @brief Rendering mode: 'human' (display GUI) or 'rgb_array' (return frame).
+  mode: human                 # @brief Rendering mode: 'human' (GUI display) or 'rgb_array' (returns image frames).
 
 # ----------------------------------------------------------------------------- 
-# @section sensors Sensor Configuration
-# @brief Defines camera and LiDAR sensor characteristics and data shapes.
+# @section sensors Sensor configuration
+# @brief Defines camera and LiDAR characteristics and data representations.
 # -----------------------------------------------------------------------------
 sensors:
 
   # ---------------------------------------------------------------------------
-  # @subsection camera RGB Camera
-  # @brief Camera configuration for both training and visualisation.
+  # @subsection camera RGB camera
+  # @brief Configuration of the RGB camera for training and visualisation.
   # ---------------------------------------------------------------------------
   camera:
     train_resolution: { x: 84, y: 84 }     # @brief Input resolution (width × height) for machine learning models.
@@ -43,41 +43,52 @@ sensors:
     #       84 × 84 × 3 = 21,168
 
   # ---------------------------------------------------------------------------
-  # @subsection lidar LiDAR Sensor
-  # @brief LiDAR configuration for spatial perception.
+  # @subsection lidar LiDAR sensor
+  # @brief Configuration of the LiDAR sensor for spatial perception.
   # ---------------------------------------------------------------------------
   lidar:
     points: 1024                          # @brief Number of sampled points per frame.
-    features_per_point: 3                 # @brief Features per point (x, y, z).
+    features_per_point: 3                 # @brief Number of features per point (x, y, z).
     range: 50                             # @brief Maximum sensing range in metres.
     train_resolution: { x: 64, y: 64 }    # @brief Input resolution (width × height) for machine learning models.
-    channels: 1                           # @brief Number of colour channels (Greyscale/Monochrome).
+    channels: 1                           # @brief Number of channels (greyscale/monochrome).
 
-    # @note Total elements per frame:
-    #       1024 × 3 = 3,072
+    # @note Grid representation:
+    #       64 × 64 × 1 = 4,096
 
 # ----------------------------------------------------------------------------- 
-# @section actions Action Space Constraints
-# @brief Defines valid control ranges for the agent.
+# @section actions Action space constraints
+# @brief Defines the valid control input ranges for the agent.
 # -----------------------------------------------------------------------------
 actions:
   steer: [-1.0, 1.0]        # @brief Steering angle (-1.0 full left, 1.0 full right).
-  throttle: [0.0, 1.0]      # @brief Throttle input (0.0 none, 1.0 maximum).
-  brake: [0.0, 1.0]         # @brief Brake input (0.0 none, 1.0 full braking).
+  throttle: [0.0, 1.0]      # @brief Throttle input (0.0 no input, 1.0 maximum).
+  brake: [0.0, 1.0]         # @brief Brake input (0.0 no input, 1.0 full braking).
 
 # -----------------------------------------------------------------------------
-# @section risk Risk Module Settings
+# @section risk Risk module settings
 # @brief Parameters controlling risk-aware feature computation.
 # -----------------------------------------------------------------------------
 risk:
-  top_k: 5                      # @brief Number of nearest agents considered for risk evaluation.
-  search_radius: 50.0           # @brief Maximum radius (metres) to search for nearby agents.
-  ttc_sigma: 3.0                # @brief Gaussian smoothing parameter for time-to-collision (TTC) computation.
-  ttc_max: 10.0                 # @brief Maximum considered TTC (seconds) for risk normalisation.
+  top_k: 5                          # @brief Number of nearest agents considered in risk evaluation.
+  waypoints_ahead: 5                # @brief Number of future waypoints considered for path-based risk.
+  search_radius: 50.0               # @brief Maximum search radius (metres) for nearby agents.
+  ttc_sigma: 3.0                    # @brief Gaussian smoothing parameter for time-to-collision (TTC).
+  ttc_max: 10.0                     # @brief Maximum TTC considered (seconds) for normalisation.
   category_weights:
-    vehicle: 1.0                # @brief Weight for vehicle agents.
-    walker: 2.5                 # @brief Weight for pedestrian agents.
-    cyclist: 1.8                # @brief Weight for cyclist agents.
+    vehicle: 1.0                    # @brief Weight assigned to vehicle agents.
+    walker: 2.5                     # @brief Weight assigned to pedestrian agents.
+    cyclist: 1.8                    # @brief Weight assigned to cyclist agents.
+  reward:
+    goal_progress_scale: 5.0        # @brief Multiplier for distance progress reward
+    heading_alignment_scale: 0.5    # @brief Weight for alignment with waypoint direction
+    wrong_way_penalty: 2.0          # @brief Penalty for driving against lane direction
+    speed_reward_scale: 0.1         # @brief Reward per m/s of forward speed
+    speed_cap: 8.0                  # @brief Maximum speed (m/s) contributing to reward
+    collision_penalty: 20.0         # @brief Penalty applied on collision
+    time_penalty: 0.01              # @brief Small per-step penalty to encourage efficiency
+    ttc_threshold: 3.0              # @brief TTC threshold (seconds) for risk-aware penalty
+    ttc_penalty_scale: 1.0          # @brief Scaling factor for risk-based TTC penalty
 
 # -----------------------------------------------------------------------------
 # @section ppo Proximal Policy Optimisation (PPO) settings

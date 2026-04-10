@@ -1,5 +1,11 @@
-import yaml
 import os
+import sys
+import yaml
+
+try:
+    from .logger import Log
+except ImportError as e:
+    Log.error(__file__, e)
 
 def load_config():
     """
@@ -28,5 +34,5 @@ def load_config():
             return yaml.safe_load(f)
 
     except Exception as e:
-        print(f"[{__name__}] Error: {e}")
+        Log.error(__file__, e)
         return None

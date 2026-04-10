@@ -4,11 +4,15 @@ import torch.nn.functional as F
 
 class ObservationEncoder(nn.Module):
     """
-    @brief Encodes multi-modal observations (camera, LiDAR, ego state, risk features) into a latent vector.
-    
-    @details
-    This module processes camera images through a CNN, optional LiDAR input through a separate CNN,
-    and ego-state and risk features through an MLP, before combining them into a fixed-size latent representation.
+    @class ObservationEncoder
+    @brief Encodes multi-modal observations into a latent vector.
+
+    This module processes camera images, LiDAR data, ego state, and optional risk
+    features through separate branches (CNNs for visual and LiDAR inputs, MLP for
+    ego and risk features) and projects the concatenated features into a latent
+    representation suitable for downstream policy networks.
+
+    @note LiDAR and risk features are optional and can be enabled or disabled via flags.
     """
 
     def __init__(
@@ -22,14 +26,15 @@ class ObservationEncoder(nn.Module):
         use_risk=True
     ):
         """
-        @brief Initialise the ObservationEncoder.
-        @param camera_shape Tuple specifying the camera input shape (C, H, W).
-        @param lidar_shape Tuple specifying the LiDAR input shape (C, H, W).
-        @param ego_state_dim Dimension of the ego state vector.
-        @param risk_feature_dim Dimension of optional risk feature vector.
-        @param latent_dim Dimension of the final latent embedding.
-        @param use_lidar Whether to use LiDAR input.
-        @param use_risk Whether to include risk features.
+        @brief Initialise the ObservationEncoder module.
+
+        @param camera_shape Tuple[int, int, int] Shape of camera input (C, H, W)
+        @param lidar_shape Tuple[int, int, int] Shape of LiDAR input (C, H, W)
+        @param ego_state_dim int Dimension of ego state features
+        @param risk_feature_dim int Dimension of risk features
+        @param latent_dim int Dimension of output latent vector
+        @param use_lidar bool Whether to include LiDAR input branch
+        @param use_risk bool Whether to include risk feature branch
         """
 
         super().__init__()
@@ -37,81 +42,104 @@ class ObservationEncoder(nn.Module):
         self.use_lidar = use_lidar
         self.use_risk = use_risk
 
-        # Camera CNN branch
+        # ---------------- Camera CNN branch ----------------
         c, h, w = camera_shape
         self.camera_cnn = nn.Sequential(
-            nn.Conv2d(in_channels=c, out_channels=32, kernal_size=8, stride=4),
+            nn.Conv2d(c, 32, kernel_size=8, stride=4),
             nn.ReLU(),
-            nn.Conv2d(in_channels=32, out_channels=64, kernal_size=4, stride=2), # downsample spatially
+            nn.Conv2d(32, 64, kernel_size=4, stride=2),
             nn.ReLU(),
-            nn.Conv2d(in_channels=64, out_channels=64, kernel_size=3, stride=1), # feature extraction
+            nn.Conv2d(64, 64, kernel_size=3, stride=1),
             nn.ReLU(),
-            nn.Flatten(), # 64 × 7 × 7 = 3136 features
-            nn.Linear(64 * 7 * 7, 128), # project 3136 → 128; transform raw features into a compact, task-relevant representation
+            nn.Flatten()
+        )
+
+        # Compute the flattened size dynamically
+        with torch.no_grad():
+            device = next(self.parameters()).device
+            dummy = torch.zeros(1, c, h, w, device=device)
+            camera_flat_size = self.camera_cnn(dummy).shape[1]
+
+        self.camera_fc = nn.Sequential(
+            nn.Linear(camera_flat_size, 128),
             nn.ReLU()
         )
-        
-        # LiDAR CNN branch
+
+        # ---------------- LiDAR CNN branch ----------------
         if self.use_lidar:
             lc, lh, lw = lidar_shape
             self.lidar_cnn = nn.Sequential(
-                nn.Conv2d(in_channels=lc, out_channels=16, kernel_size=3, stride=2),
+                nn.Conv2d(lc, 16, kernel_size=3, stride=2),
                 nn.ReLU(),
-                nn.Conv2d(in_channels=16, out_channels=32, kernel_size=3, stride=2),
+                nn.Conv2d(16, 32, kernel_size=3, stride=2),
                 nn.ReLU(),
-                nn.Flatten(),
-                nn.Linear(32 * 14 * 14, 64), # reduce to lower-dimensional vector
+                nn.Flatten()
+            )
+
+            with torch.no_grad():
+                dummy = torch.zeros(1, lc, lh, lw, device=device)
+                lidar_flat_size = self.lidar_cnn(dummy).shape[1]
+
+            self.lidar_fc = nn.Sequential(
+                nn.Linear(lidar_flat_size, 64),
                 nn.ReLU()
             )
-        
-        # MLP for ego + risk features
-        input_dim = ego_state_dim + (risk_feature_dim if self.use_risk else 0)
+
+        # ---------------- MLP for ego + risk features ----------------
+        mlp_input_dim = ego_state_dim + (risk_feature_dim if self.use_risk else 0)
         self.mlp = nn.Sequential(
-            nn.Linear(input_dim, 64),
+            nn.Linear(mlp_input_dim, 64),
             nn.ReLU(),
             nn.Linear(64, 64),
             nn.ReLU()
         )
-        
-        # Final latent projection
+
+        # ---------------- Final latent projection ----------------
         latent_input_dim = 128 + (64 if self.use_lidar else 0) + 64
         self.fc_latent = nn.Sequential(
             nn.Linear(latent_input_dim, latent_dim),
             nn.ReLU()
         )
 
-    def forward(self, camera, ego_state, lidar=None, risk_features=None):
+    def forward(
+            self,
+            camera: torch.Tensor,
+            ego_state: torch.Tensor,
+            lidar: torch.Tensor = None,
+            risk_features: torch.Tensor = None
+        ) -> torch.Tensor:
         """
-        @brief Forward pass through the encoder.
+        @brief Forward pass through the ObservationEncoder.
 
-        @param camera Camera image tensor of shape (B, C, H, W).
-        @param ego_state Ego state tensor of shape (B, ego_state_dim).
-        @param lidar Optional LiDAR tensor of shape (B, C, H, W).
-        @param risk_features Optional risk features tensor of shape (B, risk_feature_dim).
-
-        @return Latent embedding tensor of shape (B, latent_dim).
+        @param camera Tensor Camera images [B, C, H, W]
+        @param ego_state Tensor Ego vehicle state [B, ego_state_dim]
+        @param lidar Tensor Optional LiDAR data [B, C, H, W]
+        @param risk_features Tensor Optional risk features [B, risk_feature_dim]
+        @return torch.Tensor Latent representation [B, latent_dim]
         """
+        
+        # 1. Camera Branch (e.g. [B, 128])
+        cam_feat = self.camera_fc(self.camera_cnn(camera))
+        feats = [cam_feat]
 
-        # Encode camera observations
-        camera_feat = self.camera_cnn(camera)
-        feats = [camera_feat]
-
-        # Encode LiDAR observations if provided
+        # 2. LiDAR Branch (e.g. [B, 64])
         if self.use_lidar and lidar is not None:
-            lidar_feat = self.lidar_cnn(lidar)
+            lidar_feat = self.lidar_fc(self.lidar_cnn(lidar))
             feats.append(lidar_feat)
+
+        # 3. MLP Branch (Ego + Risk) 
+        # CRITICAL: Force flatten to [Batch, Features] to avoid dimension creep
+        ego_state = ego_state.view(ego_state.size(0), -1)
         
-        # Prepare MLP input: ego state and optional risk features
-        mlp_input = ego_state
         if self.use_risk and risk_features is not None:
+            risk_features = risk_features.view(risk_features.size(0), -1)
             mlp_input = torch.cat([ego_state, risk_features], dim=-1)
-        
-        # Encode ego + risk features
+        else:
+            mlp_input = ego_state
+            
         mlp_feat = self.mlp(mlp_input)
         feats.append(mlp_feat)
 
-        # Concatenate all features and project to latent space
-        latent = torch.cat(feats, dim=-1)
-        latent = self.fc_latent(latent)
-
-        return latent
+        # 4. Final Projection
+        combined = torch.cat(feats, dim=-1)
+        return self.fc_latent(combined)
