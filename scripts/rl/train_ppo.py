@@ -184,7 +184,7 @@ def main():
                 elif collision: log_text += f"💥 Collision after {step_count} steps; "
                 else: log_text += f"⏱️  Timeout after {step_count} steps; "
 
-                log_text += f"waypoints: {info['wp_idx']}/{info['wp_total']}; "
+                log_text += f"waypoints: {info['wp_idx']}/{max(info['wp_total'], 1)}; "
                 log_text += f"total: {total_reward.sum():.2f} "
                 log_text += f"[ "
                 log_text += f"nav: {total_reward[0]:.2f}, "

@@ -288,14 +288,14 @@ class CarlaEnv(gym.Env):
         info = {
             'collision': self._check_collision(),
             'goal_reached': self._goal_reached(),
-            'ttc_min': float(self._risk_vec[4::AGENT_FEAT_DIM].min()) if self._risk_vec is not None else 0.0,
-            'goal_dist': self._prev_dist_to_goal,
-            'baseline_reward': float(baseline_rewards.sum()),
+            'ttc_min': float(self._risk_vec[4::AGENT_FEAT_DIM].min()) if self._risk_vec is not None else 0.0, # near-miss rate (TTC threshold)
+            'goal_dist': self._prev_dist_to_goal, # route completion proxy
+            'baseline_reward': float(baseline_rewards.sum()), # for PPO vs SAC comparison
             'reward_navigation': rewards[0],
             'reward_safety': rewards[1],
             'reward_risk': rewards[2],
             'wp_idx': self._waypoint_idx,
-            'wp_total': len(self._waypoints),
+            'wp_total': len(self._waypoints), # route completion = wp_idx / wp_total
         }
 
         speed = np.sqrt(self._ego['vx']**2 + self._ego['vy']**2)
