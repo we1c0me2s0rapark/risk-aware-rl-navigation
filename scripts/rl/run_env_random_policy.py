@@ -51,7 +51,7 @@ def main():
             # Step simulation
             obs, reward, done, info = env.step(action)
 
-            env.render(save=False)
+            env.render()
 
             total_reward += reward
             total_baseline += info.get('baseline_reward', 0.0)

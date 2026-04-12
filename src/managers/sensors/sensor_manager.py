@@ -125,20 +125,24 @@ class SensorManager:
         @return Concatenated NumPy array of camera and LiDAR features.
         """
 
+        # Downsample and normalise camera image
         cam = self.camera_data[..., :3] # RGB only
-        lidar = self.lidar_data
-
-        # Resize camera
         cam_resized = cv2.resize(cam, camera_resolution)
+        cam_norm = cam_resized.astype(np.float32) / 255.0
 
-        # Downsample LiDAR
+        # Downsample and normalise LiDAR points
+        lidar = self.lidar_data
         if lidar.shape[0] > lidar_points:
             idx = np.random.choice(lidar.shape[0], lidar_points, replace=False)
             lidar = lidar[idx]
+        elif lidar.shape[0] < lidar_points:
+            # Pad with zeros if not enough points yet
+            pad = np.zeros((lidar_points - lidar.shape[0], lidar.shape[1]), dtype=np.float32)
+            lidar = np.vstack([lidar, pad])
 
-        cam_norm = cam_resized.astype(np.float32) / 255.0
         lidar_norm = np.clip(lidar / self.lidar_range, -1.0, 1.0) # clip to [-1,1] to avoid outliers
 
+        # --- Concatenate after both are ready ---
         obs = np.concatenate([cam_norm.flatten(), lidar_norm.flatten()])
         return obs
 
@@ -151,8 +155,9 @@ class SensorManager:
         if self.camera_data is None: return False
 
         try:
+            # camera_data is BGRA (CARLA native format)
+            # cv2.imwrite expects BGR - just drop the alpha channel
             bgr_frame = self.camera_data[..., :3] # convert BGRA -> BGR
-            bgr_frame = bgr_frame[:, :, ::-1] # RGB -> BGR
 
             cv2.imwrite(file_path, bgr_frame)
             return True

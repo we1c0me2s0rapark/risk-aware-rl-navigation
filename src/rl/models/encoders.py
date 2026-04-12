@@ -20,8 +20,10 @@ class ObservationEncoder(nn.Module):
         camera_shape=(3, 84, 84),
         lidar_shape=(1, 64, 64),
         ego_state_dim=6,
-        risk_feature_dim=3,
         latent_dim=256,
+        hidden_dim=128,
+        n_reward_components=3,
+        risk_feature_dim=3,
         use_lidar=True,
         use_risk=True
     ):
@@ -31,7 +33,7 @@ class ObservationEncoder(nn.Module):
         @param camera_shape Tuple[int, int, int] Shape of camera input (C, H, W)
         @param lidar_shape Tuple[int, int, int] Shape of LiDAR input (C, H, W)
         @param ego_state_dim int Dimension of ego state features
-        @param risk_feature_dim int Dimension of risk features
+        @param n_reward_components int Dimension of reward components
         @param latent_dim int Dimension of output latent vector
         @param use_lidar bool Whether to include LiDAR input branch
         @param use_risk bool Whether to include risk feature branch
@@ -118,17 +120,17 @@ class ObservationEncoder(nn.Module):
         @return torch.Tensor Latent representation [B, latent_dim]
         """
         
-        # 1. Camera Branch (e.g. [B, 128])
+        # 1. Camera Branch
         cam_feat = self.camera_fc(self.camera_cnn(camera))
         feats = [cam_feat]
 
-        # 2. LiDAR Branch (e.g. [B, 64])
+        # 2. LiDAR Branch
         if self.use_lidar and lidar is not None:
             lidar_feat = self.lidar_fc(self.lidar_cnn(lidar))
             feats.append(lidar_feat)
 
         # 3. MLP Branch (Ego + Risk) 
-        # CRITICAL: Force flatten to [Batch, Features] to avoid dimension creep
+        # Flatten to [B, features] in case input has extra dimensions
         ego_state = ego_state.view(ego_state.size(0), -1)
         
         if self.use_risk and risk_features is not None:

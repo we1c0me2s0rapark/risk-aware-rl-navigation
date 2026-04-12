@@ -66,7 +66,7 @@ __pycache__/
 ## Training runs, logs, and checkpoints
 runs/
 logs/
-checkpoints/
+results/
 
 
 #==============================================================================

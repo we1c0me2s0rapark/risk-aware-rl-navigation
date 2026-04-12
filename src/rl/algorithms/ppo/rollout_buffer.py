@@ -67,9 +67,19 @@ class RolloutBuffer:
         self.obs.append(obs)
         self.actions.append(action.detach())
         self.log_probs.append(log_prob.detach())
-        self.rewards.append(torch.tensor(reward, dtype=torch.float32, device=self.device))
         self.values.append(value.detach())
-        self.dones.append(torch.tensor(done, dtype=torch.float32, device=self.device))
+        
+        if not isinstance(reward, torch.Tensor):
+            reward_tensor = torch.tensor(reward, dtype=torch.float32, device=self.device)
+        else:
+            reward_tensor = reward.detach().clone().to(self.device)
+        self.rewards.append(reward_tensor)
+        
+        if not isinstance(done, torch.Tensor):
+            done_tensor = torch.tensor(done, dtype=torch.float32, device=self.device)
+        else:
+            done_tensor = done.detach().clone().to(self.device).float()
+        self.dones.append(done_tensor)
 
     def compute_returns_advantages(self, gamma: float = 0.99, lam: float = 0.95, last_value=0, objective_weights=None):
         """
