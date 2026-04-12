@@ -5,20 +5,21 @@ from torch import Tensor
 from torch.distributions import Normal
 from typing import Dict, Tuple
 
+ws_root_path = os.path.abspath(os.path.join(
+    os.path.dirname(__file__), "..", "..", ".."
+))
+
 try:
     # Allow importing from the src directory
     sys.path.append(os.path.abspath(os.path.join(
-        os.path.dirname(__file__), "..", "..", ".."
-    )))
-    sys.path.append(os.path.abspath(os.path.join(
-        os.path.dirname(__file__), "..", "..", "..", "rl"
+        ws_root_path, "src"
     )))
 
     from managers.utils.logger import Log
-    from common.policy import Policy
-    from models.actor import PPOActor
-    from models.critic import PPOCritic
-    from models.encoders import ObservationEncoder
+    from rl.common.policy import Policy
+    from rl.models.actor import PPOActor
+    from rl.models.critic import PPOCritic
+    from rl.models.encoders import ObservationEncoder
 except ImportError as e:
     Log.error(__file__, e)
 
@@ -50,9 +51,12 @@ class PPOPolicy(Policy):
         self.encoder = ObservationEncoder(**obs_config).to(self.device)
 
         # Actor and critic networks
-        latent_dim = 256 # could be made configurable
-        self.actor = PPOActor(latent_dim=latent_dim, action_dim=action_dim, continuous=True).to(self.device)
-        self.critic = PPOCritic(latent_dim=latent_dim).to(self.device)
+        latent_dim = obs_config["latent_dim"]
+        hidden_dim = obs_config["hidden_dim"]
+        n_reward_components = obs_config["n_reward_components"]
+        continuous = True # PPO with continuous actions
+        self.actor = PPOActor(latent_dim=latent_dim, action_dim=action_dim, continuous=continuous).to(self.device)
+        self.critic = PPOCritic(latent_dim=latent_dim, hidden_dim=hidden_dim, n_reward_components=n_reward_components).to(self.device)
 
     def _encode(self, obs: Dict[str, Tensor]) -> Tensor:
         """

@@ -16,7 +16,6 @@ try:
 except ImportError as e:
     Log.error(__file__, e)
 
-
 def test_ppo_agent():
     """
     @brief Test the PPOAgent class with dummy data.

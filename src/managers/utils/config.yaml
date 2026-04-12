@@ -22,7 +22,9 @@ simulation:
 # @brief Defines the rendering mode of the environment.
 # -----------------------------------------------------------------------------
 render:
-  mode: human                 # @brief Rendering mode: 'human' (GUI display) or 'rgb_array' (returns image frames).
+  root: results               # @brief Root directory for saving rendered outputs.
+  is_display: 1               # @brief Whether to display the rendered environment during training.
+  is_save_frames: 0           # @brief Whether to save individual frames of the rendered environment.
 
 # ----------------------------------------------------------------------------- 
 # @section sensors Sensor configuration

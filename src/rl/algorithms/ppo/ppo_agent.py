@@ -2,19 +2,20 @@ import os
 import sys
 import torch
 
+ws_root_path = os.path.abspath(os.path.join(
+    os.path.dirname(__file__), "..", "..", ".."
+))
+
 try:
     # Allow importing from the src directory
     sys.path.append(os.path.abspath(os.path.join(
-        os.path.dirname(__file__), "..", "..", ".."
-    )))
-    sys.path.append(os.path.abspath(os.path.join(
-        os.path.dirname(__file__), "..", "..", "..", "rl"
+        ws_root_path, "src"
     )))
 
     from managers.utils.logger import Log
-    from algorithms.ppo.rollout_buffer import RolloutBuffer
-    from algorithms.ppo.ppo_trainer import PPOTrainer
-    from algorithms.ppo.ppo_policy import PPOPolicy
+    from rl.algorithms.ppo.rollout_buffer import RolloutBuffer
+    from rl.algorithms.ppo.ppo_trainer import PPOTrainer
+    from rl.algorithms.ppo.ppo_policy import PPOPolicy
 except ImportError as e:
     Log.error(__file__, e)
 
@@ -55,7 +56,7 @@ class PPOAgent:
         # --- Initialise rollout buffer ---
         self.buffer = RolloutBuffer(
             buffer_size=2048,
-            obs_shape=None,  # inferred from observations during storage
+            obs_shape=None, # inferred from observations during storage
             action_dim=action_dim,
             device=torch.device(device)
         )

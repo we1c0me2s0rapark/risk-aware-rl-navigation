@@ -38,6 +38,7 @@ def test_ppo_policy():
         "ego_state_dim": 6,
         "risk_feature_dim": 3,
         "latent_dim": 256,
+        "hidden_dim": 128,
         "use_lidar": True,
         "use_risk": True
     }

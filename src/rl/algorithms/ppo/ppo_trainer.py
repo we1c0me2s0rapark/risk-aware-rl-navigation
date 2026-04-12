@@ -106,7 +106,7 @@ class PPOTrainer:
             for i in range(0, dataset_size, self.batch_size):
                 batch_idx = indices[i:i + self.batch_size]
 
-                batch_obs = self.collate_obs([obs[j] for j in batch_idx])
+                batch_obs = self.collate_obs([obs[j.item()] for j in batch_idx])
                 batch_actions = actions[batch_idx]
                 batch_old_lp = old_log_probs[batch_idx]
                 batch_returns = returns[batch_idx]
