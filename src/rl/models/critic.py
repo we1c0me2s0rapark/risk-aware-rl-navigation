@@ -87,7 +87,7 @@ class SACCritic(nn.Module):
         )
  
         # ---- Q2 network ----
-        # Identical architecture but separate weights — essential for double Q
+        # Identical architecture but separate weights - essential for double Q
         self.q2 = nn.Sequential(
             nn.Linear(input_dim, hidden_dim),
             nn.ReLU(),
@@ -121,3 +121,123 @@ class SACCritic(nn.Module):
         """
         x = torch.cat([latent, action], dim=-1)
         return self.q1(x)
+
+class DistributionalCritic(nn.Module):
+    """
+    @class DistributionalCritic
+    @brief Double distributional Q-network for CVaR-SAC using quantile regression.
+
+    @details
+    Extends the standard SAC double Q-network by replacing scalar Q-value
+    outputs with a distribution over returns represented as N quantiles.
+
+    Each network outputs Z1(s,a) and Z2(s,a) - vectors of N quantile values
+    that approximate the full return distribution. This enables risk-sensitive
+    objectives like CVaR to be computed directly from the predicted quantiles.
+
+    Quantile regression loss (asymmetric Huber loss) is used during training
+    to fit the predicted quantiles to their target positions in the distribution.
+
+    Architecture per network:
+        [latent + action] → Linear → ReLU → Linear → ReLU → Linear → [N quantiles]
+
+    During Bellman backup, the minimum quantile-wise across Z1 and Z2 is used
+    as the target to prevent distributional overestimation.
+    """
+
+    def __init__(
+        self,
+        latent_dim: int,
+        action_dim: int,
+        n_quantiles: int = 32,
+        hidden_dim: int = 256,
+    ):
+        """
+        @brief Initialise the double distributional critic.
+
+        @param latent_dim int Dimension of the latent state encoding.
+        @param action_dim int Dimension of the action vector.
+        @param n_quantiles int Number of quantiles to predict per network (default 32).
+        @param hidden_dim int Width of hidden layers in each network.
+        """
+        super().__init__()
+
+        self.n_quantiles = n_quantiles
+        input_dim = latent_dim + action_dim
+
+        # ---- Z1 network - outputs N quantile values ----
+        self.z1 = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, self.n_quantiles),
+        )
+
+        # ---- Z2 network - identical architecture, separate weights ----
+        self.z2 = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, self.n_quantiles),
+        )
+
+    def forward(self, latent: torch.Tensor, action: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        @brief Forward pass through both distributional Q-networks.
+
+        @param latent torch.Tensor Latent state encoding [B, latent_dim].
+        @param action torch.Tensor Action tensor [B, action_dim].
+        @return tuple[torch.Tensor, torch.Tensor] Z1 and Z2 quantiles, each [B, N].
+        """
+
+        x = torch.cat([latent, action], dim=-1)
+        return self.z1(x), self.z2(x)
+
+    def z1_forward(self, latent: torch.Tensor, action: torch.Tensor) -> torch.Tensor:
+        """
+        @brief Forward pass through Z1 only.
+
+        @details
+        Used during actor updates to compute CVaR from Z1 quantiles,
+        avoiding redundant computation through Z2.
+
+        @param latent torch.Tensor Latent state encoding [B, latent_dim].
+        @param action torch.Tensor Action tensor [B, action_dim].
+        @return torch.Tensor Z1 quantiles [B, N].
+        """
+
+        x = torch.cat([latent, action], dim=-1)
+        return self.z1(x)
+
+    def cvar(self, latent: torch.Tensor, action: torch.Tensor, alpha: float = 0.1) -> torch.Tensor:
+        """
+        @brief Compute CVaR_alpha from Z1 quantiles.
+
+        @details
+        CVaR (Conditional Value at Risk) at level alpha is the expected
+        return in the worst alpha fraction of outcomes:
+
+            CVaR_α(Z) = E[Z | Z ≤ quantile_α(Z)]
+
+        With N=32 quantiles and alpha=0.1, the worst 3 quantiles are averaged
+        (32 * 0.1 = 3.2, floored to 3). These represent the left tail of the
+        return distribution - the catastrophic outcomes the agent learns to avoid.
+
+        @param latent torch.Tensor Latent state encoding [B, latent_dim].
+        @param action torch.Tensor Action tensor [B, action_dim].
+        @param alpha float CVaR confidence level (default 0.1 = worst 10%).
+        @return torch.Tensor CVaR values of shape [B, 1].
+        """
+        
+        quantiles = self.z1_forward(latent, action) # [B, N]
+
+        # Sort ascending so lowest quantiles (worst outcomes) come first
+        quantiles_sorted, _ = torch.sort(quantiles, dim=-1)
+
+        # Take the worst alpha fraction
+        n_cvar = max(1, int(self.n_quantiles * alpha))
+        cvar = quantiles_sorted[:, :n_cvar].mean(dim=-1, keepdim=True) # [B, 1]
+
+        return cvar
