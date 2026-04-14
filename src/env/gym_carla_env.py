@@ -567,7 +567,7 @@ class CarlaEnv(gym.Env):
  
         Camera data is returned as flat RGB (channels=3) by the sensor manager.
         LiDAR data is returned with 4 features per point (xyzI) from the sensor
-        buffer — the intensity channel is dropped here to match the configured
+        buffer - the intensity channel is dropped here to match the configured
         features_per_point=3.
  
         @return dict Observation containing:
@@ -641,7 +641,7 @@ class CarlaEnv(gym.Env):
  
         @details
         Termination occurs on collision or episode timeout.
-        Does not include goal_reached — used for baseline comparison only.
+        Does not include goal_reached - used for baseline comparison only.
  
         @return bool True if the episode is complete.
         """

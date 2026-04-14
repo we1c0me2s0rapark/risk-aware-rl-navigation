@@ -78,9 +78,9 @@ class SACAgent:
         """
         self.buffer.store(obs, action, reward, next_obs, done)
 
-    def update(self):
+    def update(self) -> dict | None:
         """
-        @brief Perform a SAC update if buffer has enough transitions.
+        @brief Perform a CVaR-SAC update if buffer has enough transitions.
 
         @return dict Loss metrics or None if buffer not ready.
         """

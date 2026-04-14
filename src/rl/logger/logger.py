@@ -16,42 +16,42 @@ try:
 except ImportError as e:
     Log.error(__file__, e)
 
+
 class TrainingLogger:
     """
     @class TrainingLogger
-    @brief TensorBoard logging for PPO and SAC training runs.
+    @brief TensorBoard logging for PPO, SAC, and CVaR-SAC training runs.
 
     @details
     Wraps SummaryWriter to provide structured logging of training metrics.
-    Supports both PPO (rollout-based) and SAC (step-based) logging patterns.
+    Supports PPO (rollout-based), SAC (step-based), and CVaR-SAC (step-based
+    with additional CVaR distribution metrics).
 
     Logged metrics:
 
-    Episode metrics (logged per episode):
-        - reward/total
-        - reward/navigation
-        - reward/safety
-        - reward/risk
+    Episode metrics (all algorithms, per episode):
+        - reward/total, reward/navigation, reward/safety, reward/risk
         - reward/baseline
-        - episode/steps
-        - episode/collision
-        - episode/goal_reached
+        - episode/collision, episode/goal_reached
         - episode/waypoint_completion
+        - episode/ttc_min
+        - safety/near_miss
 
-    Rollout metrics (PPO only, logged per rollout):
-        - loss/actor
-        - loss/critic
-        - loss/entropy
-        - loss/total
+    Rollout metrics (PPO only, per rollout):
+        - loss/actor, loss/critic, loss/entropy, loss/total
 
-    Step metrics (SAC only, logged per update step):
-        - loss/actor
-        - loss/critic
-        - loss/alpha
-        - sac/alpha
+    Step metrics (SAC, per step):
+        - loss/actor, loss/critic, loss/alpha
+        - sac/alpha, sac/buffer_size
+
+    Step metrics (CVaR-SAC, extends SAC):
+        - loss/actor, loss/critic, loss/alpha
+        - sac/alpha, sac/buffer_size
+        - cvar/mean        — mean CVaR across the batch
+        - cvar/alpha       — the configured CVaR confidence level
 
     Usage:
-        logger = TrainingLogger(log_dir="runs/ppo")
+        logger = TrainingLogger(log_dir="runs/ppo", algorithm="ppo")
         logger.log_episode(episode=1, reward=np.array([...]), info={...})
         logger.log_ppo_losses(rollout=5, actor_loss=0.1, critic_loss=0.3, entropy=0.01)
         logger.log_sac_losses(step=1000, losses={...})
@@ -63,14 +63,14 @@ class TrainingLogger:
         @brief Initialise the TensorBoard logger.
 
         @param log_dir str Directory to write TensorBoard event files.
-        @param algorithm str Algorithm identifier ('ppo' or 'sac') for log organisation.
+        @param algorithm str Algorithm identifier ('ppo', 'sac', or 'cvar_sac').
         """
         os.makedirs(log_dir, exist_ok=True)
         self.writer = SummaryWriter(log_dir=log_dir)
         self.algorithm = algorithm.lower()
 
-        Log.info(__file__, f"[TrainingLogger] TensorBoard logging to: {log_dir}")
-        Log.info(__file__, f"[TrainingLogger] Run: tensorboard --logdir={os.path.dirname(log_dir)}")
+        Log.info(__file__, f"TensorBoard logging to: {log_dir}")
+        Log.info(__file__, f"Run: tensorboard --logdir={os.path.dirname(log_dir)}")
 
     def log_episode(
         self,
@@ -132,6 +132,7 @@ class TrainingLogger:
         @param entropy float Mean policy entropy.
         @param total_loss float Optional combined loss.
         """
+        
         self.writer.add_scalar('loss/actor',   actor_loss,  rollout)
         self.writer.add_scalar('loss/critic',  critic_loss, rollout)
         self.writer.add_scalar('loss/entropy', entropy,     rollout)
@@ -141,26 +142,51 @@ class TrainingLogger:
 
     def log_sac_losses(self, step: int, losses: dict):
         """
-        @brief Log SAC update losses per step.
+        @brief Log SAC or CVaR-SAC update losses per step.
+
+        @details
+        Also handles CVaR-SAC losses — if 'cvar_mean' is present in the
+        losses dict, it is logged under the cvar/ namespace automatically.
 
         @param step int Global step index.
-        @param losses dict Keys: 'critic_loss', 'actor_loss', 'alpha_loss', 'alpha'.
+        @param losses dict Keys: 'critic_loss', 'actor_loss', 'alpha_loss',
+                           'alpha', and optionally 'cvar_mean' (CVaR-SAC only).
         """
+
         if losses is None:
             return
 
-        self.writer.add_scalar('loss/critic',    losses.get('critic_loss', 0.0), step)
-        self.writer.add_scalar('loss/actor',     losses.get('actor_loss',  0.0), step)
-        self.writer.add_scalar('loss/alpha',     losses.get('alpha_loss',  0.0), step)
-        self.writer.add_scalar('sac/alpha',      losses.get('alpha',       0.0), step)
+        self.writer.add_scalar('loss/critic', losses.get('critic_loss', 0.0), step)
+        self.writer.add_scalar('loss/actor',  losses.get('actor_loss',  0.0), step)
+        self.writer.add_scalar('loss/alpha',  losses.get('alpha_loss',  0.0), step)
+        self.writer.add_scalar('sac/alpha',   losses.get('alpha',       0.0), step)
+
+        # CVaR-SAC specific — logged automatically if present
+        if 'cvar_mean' in losses:
+            self.writer.add_scalar('cvar/mean', losses['cvar_mean'], step)
+
+    def log_cvar_alpha(self, step: int, cvar_alpha: float):
+        """
+        @brief Log the CVaR confidence level (CVaR-SAC only).
+
+        @details
+        Logs the configured CVaR alpha periodically so it appears alongside
+        the cvar/mean curve in TensorBoard for reference.
+
+        @param step int Global step index.
+        @param cvar_alpha float CVaR confidence level (e.g. 0.1).
+        """
+
+        self.writer.add_scalar('cvar/alpha', cvar_alpha, step)
 
     def log_buffer_size(self, step: int, size: int):
         """
-        @brief Log replay buffer size (SAC).
+        @brief Log replay buffer size (SAC and CVaR-SAC).
 
         @param step int Global step index.
         @param size int Current number of transitions in buffer.
         """
+
         self.writer.add_scalar('sac/buffer_size', size, step)
 
     def log_near_miss_rate(self, episode: int, near_miss: bool, ttc_threshold: float = 2.0):
@@ -171,9 +197,11 @@ class TrainingLogger:
         @param near_miss bool Whether TTC dropped below threshold this episode.
         @param ttc_threshold float TTC threshold in seconds defining a near-miss.
         """
+
         self.writer.add_scalar('safety/near_miss', float(near_miss), episode)
 
     def close(self):
         """@brief Flush and close the TensorBoard writer."""
+
         self.writer.flush()
         self.writer.close()
