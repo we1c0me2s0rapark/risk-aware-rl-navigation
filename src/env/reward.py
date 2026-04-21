@@ -36,7 +36,7 @@ def navigation_reward(reward_config: dict, ego: dict, goal_progress: float, wp_d
 
     r  = goal_progress * reward_config['goal_progress_scale']
     r += alignment * reward_config['heading_alignment_scale']
-    r += min(speed, reward_config['speed_cap']) * reward_config['speed_reward_scale']
+    r += min(speed, reward_config['speed_cap']) * max(alignment, 0.0) * reward_config['speed_reward_scale']
     r -= reward_config['time_penalty']
     return r
 
