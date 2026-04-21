@@ -1,6 +1,5 @@
 import torch
 import numpy as np
-from collections import deque
 import random
 
 class ReplayBuffer:
@@ -29,7 +28,9 @@ class ReplayBuffer:
         self.capacity = capacity
         self.device = device
         self.min_samples = min_samples
-        self.buffer = deque(maxlen=capacity)
+        self.buffer = [None] * capacity
+        self._write_idx = 0
+        self._size = 0
 
     def store(
         self,
@@ -59,7 +60,9 @@ class ReplayBuffer:
         reward_tensor = torch.tensor(reward, dtype=torch.float32)
         done_tensor = torch.tensor(float(done), dtype=torch.float32)
 
-        self.buffer.append((obs_cpu, action_cpu, reward_tensor, next_obs_cpu, done_tensor))
+        self.buffer[self._write_idx] = (obs_cpu, action_cpu, reward_tensor, next_obs_cpu, done_tensor)
+        self._write_idx = (self._write_idx + 1) % self.capacity
+        self._size = min(self._size + 1, self.capacity)
 
     def sample(self, batch_size: int):
         """
@@ -77,7 +80,8 @@ class ReplayBuffer:
             - next_obs: dict of batched tensors [B, ...]
             - dones: torch.Tensor [B]
         """
-        batch = random.sample(self.buffer, batch_size)
+        indices = random.sample(range(self._size), batch_size)
+        batch = [self.buffer[i] for i in indices]
         obs_list, actions, rewards, next_obs_list, dones = zip(*batch)
 
         # Stack observations dict-of-tensors → dict of batched tensors
@@ -102,7 +106,7 @@ class ReplayBuffer:
 
         @return int Number of transitions in the buffer.
         """
-        return len(self.buffer)
+        return self._size
 
     @property
     def ready(self) -> bool:
@@ -111,4 +115,4 @@ class ReplayBuffer:
         
         @return bool True if buffer contains at least min_samples transitions.
         """
-        return len(self.buffer) >= self.min_samples
+        return self._size >= self.min_samples
