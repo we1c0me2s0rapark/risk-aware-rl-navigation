@@ -94,13 +94,7 @@ def main():
     done = False
 
     # Hyperparameters
-    action_dim = 3              # [steer, throttle, brake]
-    learning_starts = 1_000     # warm-up steps with random actions before training begins
-    save_every = 1_000          # steps between checkpoint saves
-    log_every = 1_000           # steps between periodic log outputs
-    batch_size = 256            # minibatch size for SAC updates
-    buffer_capacity = 500_000   # maximum transitions stored in replay buffer
-    total_steps = 1_000_000
+    action_dim = 3 # [steer, throttle, brake]
 
     # Use GPU if available
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -126,6 +120,15 @@ def main():
 
         # Root directory for saving outputs
         render_root = env.config['render']['root']
+
+        # SAC hyperparameters from config
+        sac_cfg = env.config['sac']
+        total_steps = sac_cfg['total_steps']
+        batch_size = sac_cfg['batch_size']
+        buffer_capacity = sac_cfg['buffer_capacity']
+        learning_starts = sac_cfg['learning_starts']
+        save_every = sac_cfg['save_every']
+        log_every = sac_cfg['log_every']
 
         # --- Observation configuration ---
         obs_config = dict(

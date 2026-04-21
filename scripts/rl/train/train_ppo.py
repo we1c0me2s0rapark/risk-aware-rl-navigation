@@ -95,10 +95,10 @@ def main():
     old_settings = termios.tcgetattr(fd)
     
     # Tracking variables
-    step_count = 0      # steps within current episode (resets on done)
-    rollout_step = 0    # steps within current rollout (resets after update)
-    rollout_count = 0   # number of completed rollouts (for checkpointing)
-    episode = 0         # total episode count
+    step_count = 0 # steps within current episode (resets on done)
+    rollout_step = 0 # steps within current rollout (resets after update)
+    rollout_count = 0 # number of completed rollouts (for checkpointing)
+    episode = 0 # total episode count
 
     # Cumulative rewards for logging
     total_reward = np.zeros(3)
@@ -107,7 +107,6 @@ def main():
 
     # PPO hyperparameters
     action_dim = 3 # [steer, throttle, brake]
-    rollout_size = 2048 # fixed rollout size
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     # --- Initialise environment ---
@@ -131,6 +130,7 @@ def main():
 
         # Root directory for saving outputs
         render_root = env.config['render']['root']
+        rollout_size = env.config['ppo']['rollout_steps']
         
         # --- Observation configuration ---
         obs_config = dict(
@@ -242,8 +242,8 @@ def main():
 
                 # Reset episode tracking
                 episode += 1
-                total_reward = np.zeros(3)      # reset per episode
-                total_baseline = np.zeros(3)    # reset per episode
+                total_reward = np.zeros(3) # reset per episode
+                total_baseline = np.zeros(3) # reset per episode
                 step_count = 0
                 obs = env.reset()
 

@@ -97,15 +97,7 @@ def main():
     total_reward = np.zeros(3)
     done = False
 
-    action_dim = 3              # [steer, throttle, brake]
-    n_quantiles = 32            # quantiles for distributional critic
-    cvar_alpha = 0.1            # CVaR confidence level (worst 10%)
-    learning_starts = 1_000     # warm-up steps before first update
-    save_every = 10_000
-    log_every = 1_000
-    batch_size = 256
-    buffer_capacity = 500_000
-    total_steps = 1_000_000
+    action_dim = 3 # [steer, throttle, brake]
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -130,6 +122,17 @@ def main():
 
         # Root directory for saving outputs
         render_root = env.config['render']['root']
+
+        # CVaR-SAC hyperparameters from config
+        cvar_cfg = env.config['cvar_sac']
+        total_steps = cvar_cfg['total_steps']
+        batch_size = cvar_cfg['batch_size']
+        buffer_capacity = cvar_cfg['buffer_capacity']
+        learning_starts = cvar_cfg['learning_starts']
+        save_every = cvar_cfg['save_every']
+        log_every = cvar_cfg['log_every']
+        n_quantiles = cvar_cfg['n_quantiles']
+        cvar_alpha = cvar_cfg['cvar_alpha']
 
         # --- Observation configuration ---
         obs_config = dict(
@@ -163,7 +166,7 @@ def main():
         checkpoint_dir = os.path.abspath(os.path.join(
             ws_root_path, render_root, "checkpoints"
         ))
-        checkpoint_manager = CheckpointManager(parent_dir=checkpoint_dir, ws_dir="ppo")
+        checkpoint_manager = CheckpointManager(parent_dir=checkpoint_dir, ws_dir="cvar_sac")
         rollout_count = checkpoint_manager.load(agent) # returns 0 if no checkpoint
 
         # --- TensorBoard logger ---

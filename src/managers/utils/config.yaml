@@ -105,3 +105,29 @@ ppo:
   batch_size: 64
   rollout_steps: 2048
   epochs: 10
+
+# -----------------------------------------------------------------------------
+# @section sac Soft Actor-Critic (SAC) settings
+# @brief Hyperparameters for off-policy SAC training.
+# -----------------------------------------------------------------------------
+sac:
+  total_steps: 1_000_000       # @brief Total environment steps to train for.
+  batch_size: 256               # @brief Minibatch size for each SAC update.
+  buffer_capacity: 500_000      # @brief Maximum number of transitions in the replay buffer.
+  learning_starts: 1_000        # @brief Warm-up steps with random actions before training begins.
+  save_every: 1_000             # @brief Steps between checkpoint saves.
+  log_every: 1_000              # @brief Steps between periodic log outputs.
+
+# -----------------------------------------------------------------------------
+# @section cvar_sac CVaR Soft Actor-Critic (CVaR-SAC) settings
+# @brief Hyperparameters for risk-aware distributional SAC training.
+# -----------------------------------------------------------------------------
+cvar_sac:
+  total_steps: 1_000_000       # @brief Total environment steps to train for.
+  batch_size: 256               # @brief Minibatch size for each CVaR-SAC update.
+  buffer_capacity: 500_000      # @brief Maximum number of transitions in the replay buffer.
+  learning_starts: 1_000        # @brief Warm-up steps with random actions before training begins.
+  save_every: 10_000            # @brief Steps between checkpoint saves.
+  log_every: 1_000              # @brief Steps between periodic log outputs.
+  n_quantiles: 32               # @brief Number of quantiles for the distributional critic.
+  cvar_alpha: 0.1               # @brief CVaR confidence level (worst fraction of outcomes to optimise for).
