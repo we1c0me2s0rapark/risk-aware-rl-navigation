@@ -1,6 +1,6 @@
 import numpy as np
 
-# Feature slot width — must match AGENT_FEAT_DIM in risk/module.py.
+# Feature slot width - must match AGENT_FEAT_DIM in risk/module.py.
 #
 # Layout per agent:
 #   [ dist | category_one_hot | ttc | risk | relative_velocity ]
@@ -117,7 +117,7 @@ def decomposed_reward(
     @param wp_dx float Normalised x-component of waypoint direction.
     @param wp_dy float Normalised y-component of waypoint direction.
     @param wrong_way_risk float Wrong-way risk score in [0, 1].
-    @return np.ndarray of shape (3,) — [r_nav, r_safe, r_risk].
+    @return np.ndarray of shape (3,) - [r_nav, r_safe, r_risk].
     """
     r_nav  = navigation_reward(reward_config, ego, goal_progress, wp_dx, wp_dy)
     r_safe = safety_reward(reward_config, collision, wrong_way_risk)

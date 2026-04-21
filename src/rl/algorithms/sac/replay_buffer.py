@@ -11,7 +11,7 @@ class ReplayBuffer:
     @details
     Stores transitions (obs, action, reward, next_obs, done) and samples
     random minibatches for off-policy training. Unlike PPO's RolloutBuffer,
-    this buffer is not cleared after each update — transitions are retained
+    this buffer is not cleared after each update - transitions are retained
     and overwritten in a FIFO manner once capacity is reached.
 
     Observations are stored as dictionaries of tensors to support the

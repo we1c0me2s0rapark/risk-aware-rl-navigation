@@ -80,7 +80,7 @@ class SACActor(nn.Module):
 
     where u is the pre-squash sample and a = tanh(u).
 
-    This correction is critical for SAC's entropy maximisation objective —
+    This correction is critical for SAC's entropy maximisation objective -
     without it, the entropy estimate is biased and training is unstable.
     """
 
@@ -111,7 +111,7 @@ class SACActor(nn.Module):
 
     def forward(self, x: torch.Tensor):
         """
-        @brief Forward pass — compute mean and log_std of the Gaussian.
+        @brief Forward pass - compute mean and log_std of the Gaussian.
 
         @param x torch.Tensor Latent features [B, latent_dim].
         @return tuple[torch.Tensor, torch.Tensor] (mean, log_std), each [B, action_dim].
