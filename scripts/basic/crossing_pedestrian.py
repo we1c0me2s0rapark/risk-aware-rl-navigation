@@ -15,7 +15,7 @@ try:
     from managers.utils import SpectatorManager
     from managers.actors import VehicleManager, PedestrianManager
 except ImportError as e:
-    print(f"[{__name__}] Error: {e}")
+    print(f"[ERROR at {os.path.basename(__file__)}] {e}")
 
 
 def main() -> None:

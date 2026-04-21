@@ -33,7 +33,7 @@ try:
     from managers.utils.logger import Log
     from risk.module import RiskModule, AGENT_FEAT_DIM
 except ImportError as e:
-    Log.error(__file__, e)
+    print(f"[ERROR at {os.path.basename(__file__)}] {e}")
 
 @dataclass
 class FrameRecordState:

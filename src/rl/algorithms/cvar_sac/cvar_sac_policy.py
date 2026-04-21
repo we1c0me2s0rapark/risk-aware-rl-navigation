@@ -15,7 +15,7 @@ try:
     from rl.algorithms.sac.sac_policy import SACPolicy
     from rl.models.critic import DistributionalCritic
 except ImportError as e:
-    Log.error(__file__, e)
+    print(f"[ERROR at {os.path.basename(__file__)}] {e}")
 
 class CVaRSACPolicy(SACPolicy):
     """

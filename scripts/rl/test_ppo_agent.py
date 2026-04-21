@@ -14,7 +14,7 @@ try:
     from managers.utils.logger import Log
     from algorithms.ppo.ppo_agent import PPOAgent
 except ImportError as e:
-    Log.error(__file__, e)
+    print(f"[ERROR at {os.path.basename(__file__)}] {e}")
 
 def test_ppo_agent():
     """

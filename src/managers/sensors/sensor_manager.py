@@ -1,5 +1,4 @@
 import os
-import sys
 import pygame
 import cv2
 import carla
@@ -10,7 +9,7 @@ try:
     from cpp import sensor_utils
     from managers.utils.config_manager import load_config
 except ImportError as e:
-    print(f"[{__name__}] Error: {e}")
+    print(f"[ERROR at {os.path.basename(__file__)}] {e}")
 
 class SensorManager:
     """

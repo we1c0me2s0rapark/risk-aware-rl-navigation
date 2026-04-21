@@ -21,7 +21,7 @@ try:
     from rl.logger.logger import TrainingLogger
     from rl.algorithms.sac.sac_agent import SACAgent
 except ImportError as e:
-    Log.error(__file__, e)
+    print(f"[ERROR at {os.path.basename(__file__)}] {e}")
 
 def preprocess_obs(obs, config, device):
     """

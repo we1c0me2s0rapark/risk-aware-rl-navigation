@@ -17,7 +17,7 @@ try:
     from rl.algorithms.ppo.ppo_trainer import PPOTrainer
     from rl.algorithms.ppo.ppo_policy import PPOPolicy
 except ImportError as e:
-    Log.error(__file__, e)
+    print(f"[ERROR at {os.path.basename(__file__)}] {e}")
 
 
 class PPOAgent:

@@ -10,7 +10,7 @@ try:
     from carla_client.connection import connect_carla
     from carla_client.diagnostics import print_world_summary
 except ImportError as e:
-    print(f"[{__name__}] Error: {e}")
+    print(f"[ERROR at {os.path.basename(__file__)}] {e}")
 
 def main() -> None:
     """
