@@ -123,7 +123,7 @@ def main():
 
         # SAC hyperparameters from config
         sac_cfg = env.config['sac']
-        total_steps = sac_cfg['total_steps']
+        total_steps = env.config['training']['total_steps']
         batch_size = sac_cfg['batch_size']
         buffer_capacity = sac_cfg['buffer_capacity']
         learning_starts = sac_cfg['learning_starts']

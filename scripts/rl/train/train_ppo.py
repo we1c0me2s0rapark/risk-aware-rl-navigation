@@ -106,7 +106,8 @@ def main():
     done = False
 
     # PPO hyperparameters
-    action_dim = 3 # [steer, throttle, brake]
+    action_dim = 3  # [steer, throttle, brake]
+    max_rollouts = None
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     # --- Initialise environment ---
@@ -130,7 +131,8 @@ def main():
 
         # Root directory for saving outputs
         render_root = env.config['render']['root']
-        rollout_size = env.config['ppo']['rollout_steps']
+        rollout_size = env.config['ppo']['rollout_size']
+        max_rollouts = env.config['training']['total_steps'] // rollout_size
         
         # --- Observation configuration ---
         obs_config = dict(
@@ -267,6 +269,10 @@ def main():
                 rollout_step = 0
                 checkpoint_manager.save(agent, rollout_count)
 
+                if rollout_count >= max_rollouts:
+                    Log.info(__file__, f"Reached max_rollouts ({max_rollouts}). Stopping training.")
+                    break
+
     except Exception as e:
         Log.error(__file__, e)
 
@@ -274,8 +280,8 @@ def main():
         # Restore terminal settings
         termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
         
-        Log.info(__file__, 
-            f"\n🏳️  Training stopped at rollout {rollout_count}, step {rollout_step}; rewards - "
+        Log.info(__file__,
+            f"\n🏳️  Training stopped at rollout {rollout_count} (max: {max_rollouts}), step {rollout_step}; rewards - "
             f"baseline: {total_baseline.sum():.2f}\n"
             f"total: {total_reward.sum():.2f}\n"
             f"\t- nav {total_reward[0]:.2f}\n"

@@ -125,7 +125,7 @@ def main():
 
         # CVaR-SAC hyperparameters from config
         cvar_cfg = env.config['cvar_sac']
-        total_steps = cvar_cfg['total_steps']
+        total_steps = env.config['training']['total_steps']
         batch_size = cvar_cfg['batch_size']
         buffer_capacity = cvar_cfg['buffer_capacity']
         learning_starts = cvar_cfg['learning_starts']

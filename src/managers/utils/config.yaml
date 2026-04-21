@@ -6,7 +6,14 @@
 # used by the perception and reinforcement learning pipeline.
 # =============================================================================
 
-# ----------------------------------------------------------------------------- 
+# -----------------------------------------------------------------------------
+# @section training Shared training settings
+# @brief Parameters shared across all RL algorithms for fair comparison.
+# -----------------------------------------------------------------------------
+training:
+  total_steps: 500_000        # @brief Total environment steps for all algorithms (PPO, SAC, CVaR-SAC).
+
+# -----------------------------------------------------------------------------
 # @section simulation Simulation settings
 # @brief Core parameters controlling simulation timing and execution behaviour.
 # -----------------------------------------------------------------------------
@@ -103,7 +110,7 @@ ppo:
   lr_actor: 3e-4
   lr_critic: 3e-4
   batch_size: 64
-  rollout_steps: 2048
+  rollout_size: 2048
   epochs: 10
 
 # -----------------------------------------------------------------------------
@@ -111,7 +118,6 @@ ppo:
 # @brief Hyperparameters for off-policy SAC training.
 # -----------------------------------------------------------------------------
 sac:
-  total_steps: 1_000_000       # @brief Total environment steps to train for.
   batch_size: 256               # @brief Minibatch size for each SAC update.
   buffer_capacity: 500_000      # @brief Maximum number of transitions in the replay buffer.
   learning_starts: 1_000        # @brief Warm-up steps with random actions before training begins.
@@ -123,7 +129,6 @@ sac:
 # @brief Hyperparameters for risk-aware distributional SAC training.
 # -----------------------------------------------------------------------------
 cvar_sac:
-  total_steps: 1_000_000       # @brief Total environment steps to train for.
   batch_size: 256               # @brief Minibatch size for each CVaR-SAC update.
   buffer_capacity: 500_000      # @brief Maximum number of transitions in the replay buffer.
   learning_starts: 1_000        # @brief Warm-up steps with random actions before training begins.
