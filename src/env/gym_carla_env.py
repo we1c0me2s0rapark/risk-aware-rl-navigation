@@ -2,6 +2,7 @@ import os
 import sys
 import math
 import random
+import colorsys
 import torch
 import numpy as np
 from datetime import datetime
@@ -192,9 +193,47 @@ class CarlaEnv(gym.Env):
 
         self._cleanup_actors()
 
-        self.vehicle = self.vehicle_manager.spawn_ego_vehicle(set_physics=True)
+        # Spawn at a pre-validated CARLA spawn point (always accepted), then
+        # snap _waypoint_idx to the closest route waypoint so navigation and
+        # visualisation are aligned with the vehicle's actual spawn location.
+        spawn_points = self.world.get_map().get_spawn_points()
+        min_dist = self.config['simulation'].get('min_route_distance', 50.0)
+        grp = GlobalRoutePlanner(self.world.get_map(), 2.0)
+
+        min_waypoints = self.config['simulation'].get('min_route_waypoints', 50)
+
+        self.vehicle = None
+        for _ in range(20):
+            start_sp = random.choice(spawn_points)
+            candidates = [sp for sp in spawn_points if start_sp.location.distance(sp.location) >= min_dist]
+            end_loc = random.choice(candidates if candidates else spawn_points).location
+
+            self._waypoints = grp.trace_route(start_sp.location, end_loc)
+            self._destination = end_loc
+            self._dist_to_wp = 0.0
+
+            # Reject routes that are too short to be meaningful
+            if len(self._waypoints) < min_waypoints:
+                continue
+
+            # Find _waypoint_idx from start_sp before spawning so the vehicle
+            # lands at the same position as the navigation target.
+            self._waypoint_idx, self._prev_dist_to_goal = self._find_closest_waypoint_ahead(
+                transform=start_sp
+            )
+
+            # Reject if the snap puts us too close to the end of the route
+            if len(self._waypoints) - self._waypoint_idx < min_waypoints:
+                continue
+
+            self.vehicle = self.vehicle_manager.spawn_ego_vehicle(
+                set_physics=True, transform=start_sp
+            )
+            if self.vehicle is not None:
+                break
+
         if self.vehicle is None:
-            raise RuntimeError("Failed to spawn ego vehicle")
+            raise RuntimeError("Failed to find a valid spawnable route after 20 attempts")
 
         self.episode_length = 0
         self.collision_history = []
@@ -207,15 +246,13 @@ class CarlaEnv(gym.Env):
 
         self.world.tick()
 
-        spawn_points = self.world.get_map().get_spawn_points()
-        start = self.vehicle.get_location()
-        end = random.choice(spawn_points).location
-        self._destination = end
-        self._waypoint_idx = 0
+        # Recompute from actual post-tick vehicle location to guarantee a finite
+        # value — _find_closest_waypoint_ahead may return inf if no waypoint found.
+        self._prev_dist_to_goal = self.vehicle.get_location().distance(self._get_next_waypoint())
+        self._dist_to_wp = self._prev_dist_to_goal
 
-        grp = GlobalRoutePlanner(self.world.get_map(), 2.0)
-        self._waypoints = grp.trace_route(start, end)
-        self._prev_dist_to_goal = start.distance(self._get_next_waypoint())
+        self._draw_waypoints()
+        self.world.tick()  # flush drawings so they appear before the first step
 
         return self._get_observation()
 
@@ -264,11 +301,22 @@ class CarlaEnv(gym.Env):
             wrong_way_risk
         )
 
+        progress = self._compute_progress()
+
+        wp_boundary = self.config['simulation']['off_route_distance']
+        normalised_dist = min(self._dist_to_wp / wp_boundary, 1.0)
+
+        # Gate progress reward on route adherence: drifting off-route linearly
+        # reduces the progress signal to zero, so the vehicle is never rewarded
+        # for closing distance to the destination while off the road.
+        adherence = 1.0 - normalised_dist
+        gated_progress = progress * adherence
+
         baseline_rewards = baseline_reward(
             self.config['risk']['reward'],
             self._ego,
             self._check_collision(),
-            self._compute_progress(),
+            gated_progress,
             top_k=self.risk_module.top_k,
         )
 
@@ -276,13 +324,18 @@ class CarlaEnv(gym.Env):
             self.config['risk']['reward'],
             self._ego,
             self._check_collision(),
-            self._compute_progress(),
+            gated_progress,
             self._risk_vec,
             self.risk_module.top_k,
             wp_dx=wp_dx,
             wp_dy=wp_dy,
             wrong_way_risk=wrong_way_risk,
         )
+
+        # Quadratic off-route penalty: grows as (dist/boundary)^2 * scale,
+        # reaching maximum at off_route_distance where the episode also terminates.
+        off_route_penalty = (normalised_dist ** 2) * self.config['risk']['reward']['off_route_penalty_scale']
+        rewards[0] -= off_route_penalty
 
         reward = rewards
 
@@ -295,13 +348,19 @@ class CarlaEnv(gym.Env):
         done = (
             self._check_collision() or
             self._goal_reached() or
-            self._timeout()
+            self._timeout() or
+            self._off_route()
         )
 
         info = {
             'collision': self._check_collision(),
             'goal_reached': self._goal_reached(),
-            'ttc_min': float(self._risk_vec[4::AGENT_FEAT_DIM].min()) if self._risk_vec is not None else 0.0, # near-miss rate (TTC threshold)
+            'off_route': self._off_route(),
+            'ttc_min': float(min(
+                (self._risk_vec[i * AGENT_FEAT_DIM + 4] for i in range(self.risk_module.top_k)
+                 if self._risk_vec[i * AGENT_FEAT_DIM] > 0),
+                default=float('inf')
+            )) if self._risk_vec is not None else float('inf'),
             'goal_dist': self._prev_dist_to_goal, # route completion proxy
             'baseline_reward': float(baseline_rewards.sum()),
             'reward_navigation': rewards[0],
@@ -408,6 +467,38 @@ class CarlaEnv(gym.Env):
         risk = min(1.0, angle_diff / math.pi) # normalised [0, 1]
         return risk
 
+    def _find_closest_waypoint_ahead(self, from_idx: int = 0, search_limit: int = None, transform: 'carla.Transform' = None) -> tuple[int, float]:
+        """
+        @brief Find the closest waypoint ahead of the vehicle within a search window.
+
+        @param from_idx  Start index in self._waypoints to search from.
+        @param search_limit  Max number of waypoints to scan. None means entire route.
+        @param transform  Transform to use as reference. Defaults to the vehicle's current transform.
+        @return (index, distance) of the nearest ahead waypoint.
+        """
+        tf = transform if transform is not None else self.vehicle.get_transform()
+        vehicle_loc = tf.location
+        vehicle_fwd = tf.get_forward_vector()
+
+        end = len(self._waypoints) if search_limit is None else min(from_idx + search_limit, len(self._waypoints))
+        best_idx, best_dist = from_idx, float('inf')
+        fallback_idx, fallback_dist = from_idx, float('inf')
+        for i in range(from_idx, end):
+            wp_loc = self._waypoints[i][0].transform.location
+            dx = wp_loc.x - vehicle_loc.x
+            dy = wp_loc.y - vehicle_loc.y
+            d = math.hypot(dx, dy)  # √(dx²+dy²)
+            if d < fallback_dist:
+                fallback_dist, fallback_idx = d, i
+            if d > 0 and (dx / d * vehicle_fwd.x + dy / d * vehicle_fwd.y) >= 0:
+                if d < best_dist:
+                    best_dist, best_idx = d, i
+
+        # No waypoint found ahead — fall back to closest regardless of direction
+        if best_dist == float('inf'):
+            return fallback_idx, fallback_dist
+        return best_idx, best_dist
+
     def _compute_progress(self) -> float:
         """
         @brief Compute the progress made towards the goal during this step.
@@ -421,46 +512,68 @@ class CarlaEnv(gym.Env):
                       or 5.0 if a waypoint was reached this step.
         """
 
-        target = self._get_next_waypoint()
-        current_dist = self.vehicle.get_location().distance(target)
-        progress = self._prev_dist_to_goal - current_dist
-        self._prev_dist_to_goal = current_dist
+        best_idx, best_dist = self._find_closest_waypoint_ahead(
+            from_idx=self._waypoint_idx, search_limit=10
+        )
 
-        # Advance waypoint if close enough
-        if current_dist < 2.0 and self._waypoint_idx < len(self._waypoints) - 1:
-            self._waypoint_idx += 1
-            self._prev_dist_to_goal = self.vehicle.get_location().distance(
-                self._get_next_waypoint()
-            )
-            return 5.0 # waypoint reached bonus, overrides step progress
+        waypoint_advanced = best_idx > self._waypoint_idx
+        self._waypoint_idx = best_idx
+        self._dist_to_wp = best_dist if best_dist < float('inf') else 0.0
+
+        progress = self._prev_dist_to_goal - self._dist_to_wp
+        self._prev_dist_to_goal = self._dist_to_wp
+
+        if waypoint_advanced:
+            return 5.0  # waypoint reached bonus
 
         return float(progress)
 
     def _goal_reached(self) -> bool:
         """
-        @brief Determine if the ego vehicle has reached its destination.
- 
+        @brief Determine if the ego vehicle has completed the waypoint route.
+
         @details
-        Checks whether the Euclidean distance from the ego vehicle to
-        the destination is less than the configured goal threshold.
- 
-        @return bool True if within goal_threshold metres of destination.
+        Goal is reached when the vehicle has followed the planned waypoints
+        to the final waypoint and is within goal_threshold metres of it.
+        This ensures the vehicle must follow the route rather than shortcut
+        directly to the destination.
+
+        @return bool True if at the last waypoint and within goal_threshold.
         """
 
-        if self._destination is None: return False
+        if not self._waypoints:
+            return False
 
-        dist = self.vehicle.get_location().distance(self._destination)
+        last_idx = len(self._waypoints) - 1
+        if self._waypoint_idx < last_idx:
+            return False
 
+        last_wp_loc = self._waypoints[last_idx][0].transform.location
+        dist = self.vehicle.get_location().distance(last_wp_loc)
         return dist < self.config['simulation'].get('goal_threshold', 5.0)
 
     def _timeout(self) -> bool:
         """
         @brief Check if the episode has exceeded the maximum length.
- 
+
         @return bool True if the episode has timed out.
         """
 
         return self.episode_length >= self.max_episode_length
+
+    def _off_route(self) -> bool:
+        """
+        @brief Check if the vehicle has strayed beyond the observable waypoint range.
+
+        @details
+        Terminates the episode when the distance to the next waypoint reaches
+        the normalisation boundary (waypoints_ahead * 2.0 metres), ensuring the
+        full [0, 1] observation range is used before termination triggers.
+
+        @return bool True if the vehicle is beyond the off-route boundary.
+        """
+
+        return self._dist_to_wp >= self.config['simulation']['off_route_distance']
 
     def _get_next_waypoint(self):
         """
@@ -573,7 +686,7 @@ class CarlaEnv(gym.Env):
         @return dict Observation containing:
             - 'camera': flat RGB array [H*W*3]
             - 'lidar': flat xyz array [points*3] (intensity dropped)
-            - 'ego_state': [x, y, z, vx, vy, yaw, wp_dx0, wp_dy0, ..., wp_dx4, wp_dy4] (16 values)
+            - 'ego_state': [x, y, z, vx, vy, yaw, wp_dx0, wp_dy0, wp_d0, ...] (6 + waypoints_ahead*3 values)
             - 'risk_features': risk vector [top_k*11 + 6] = [61]
         """
         
@@ -610,6 +723,7 @@ class CarlaEnv(gym.Env):
 
         # Next N waypoints as relative (dx, dy) from ego position
         N_WAYPOINTS = self.config['risk']['waypoints_ahead']
+        wp_dist_norm = self.config['risk']['waypoints_ahead'] * 2.0
         waypoint_obs = []
         for i in range(N_WAYPOINTS):
             idx = self._waypoint_idx + i
@@ -618,15 +732,15 @@ class CarlaEnv(gym.Env):
                 dx = wp_loc.x - self._ego['x']
                 dy = wp_loc.y - self._ego['y']
                 dist = max(np.sqrt(dx**2 + dy**2), 1e-6)
-                waypoint_obs.extend([dx / dist, dy / dist])
+                waypoint_obs.extend([dx / dist, dy / dist, min(dist / wp_dist_norm, 1.0)])
             else:
-                waypoint_obs.extend([0.0, 0.0])  # pad if route ends
+                waypoint_obs.extend([0.0, 0.0, 0.0])  # pad if route ends
 
-        ego_state = np.array([
+        ego_state = np.nan_to_num(np.array([
             self._ego['x'], self._ego['y'], self._ego['z'],
             self._ego['vx'], self._ego['vy'], self._ego['yaw'],
-            *waypoint_obs # 5 waypoints × 2 = 10 values
-        ], dtype=np.float32)
+            *waypoint_obs # N waypoints x 3 = N*3 values
+        ], dtype=np.float32), nan=0.0, posinf=0.0, neginf=0.0)
 
         return {
             "camera": camera_obs,
@@ -691,51 +805,57 @@ class CarlaEnv(gym.Env):
     def _draw_waypoints(self):
         """
         @brief Visualise upcoming waypoints in the CARLA simulator.
- 
+
         @details
-        Draws the next 10 waypoints ahead of the current position using
-        a rainbow colour scheme, and marks the destination with a larger
-        red dot.
- 
+        Draws the next waypoints_ahead waypoints from config using a
+        colour gradient (red to blue via HSV), and marks the destination
+        with a larger red dot. The number of waypoints drawn and their
+        colours are both derived from risk.waypoints_ahead in config.
+
         Colour scheme:
-            - Waypoints +0 to +5  : rainbow (red → orange → yellow → green → blue → indigo)
-            - Remaining waypoints : violet
-            - Destination         : red (larger marker)
+            - Waypoints -N to -1 (behind) : grey — path already travelled
+            - Waypoints +0 to +(N-1)      : HSV gradient red to blue — fed into model
+            - Destination                 : red (larger marker)
         """
 
         debug = self.world.debug
+        n = self.config['risk']['waypoints_ahead']
 
-        rainbow = [
-            carla.Color(255, 0,   0  ), # red
-            carla.Color(255, 127, 0  ), # orange
-            carla.Color(255, 255, 0  ), # yellow
-            carla.Color(0,   255, 0  ), # green
-            carla.Color(0,   0,   255), # blue
-            carla.Color(75,  0,   130), # indigo
-        ]
-        violet = carla.Color(148, 0, 211)
+        # Draw a line from the vehicle to the current target waypoint
+        if self._waypoint_idx < len(self._waypoints):
+            vehicle_loc = self.vehicle.get_location() + carla.Location(z=0.5)
+            target_loc = self._waypoints[self._waypoint_idx][0].transform.location + carla.Location(z=0.5)
+            debug.draw_line(vehicle_loc, target_loc, thickness=0.02, color=carla.Color(255, 255, 0), life_time=0.1)
 
-        total_waypoints_to_draw = 10
+        # Draw N waypoints behind the current index as grey trail
+        for i in range(1, n + 1):
+            idx = self._waypoint_idx - i
+            if idx < 0:
+                break
+            wp, _ = self._waypoints[idx]
+            debug.draw_point(
+                wp.transform.location + carla.Location(z=0.5),
+                size=0.08,
+                color=carla.Color(180, 180, 180),
+                life_time=0.1,
+            )
 
-        # Find the closest waypoint to the vehicle's current position
-        ego_loc = self.vehicle.get_location()
-        closest_idx = min(
-            range(self._waypoint_idx, min(self._waypoint_idx + 50, len(self._waypoints))),
-            key=lambda i: self._waypoints[i][0].transform.location.distance(ego_loc),
-            default=self._waypoint_idx
-        )
+        # Draw the exact N waypoints fed into the model observation
+        colours = []
+        for i in range(n):
+            hue = (i / max(n - 1, 1)) * 0.8  # span red → blue, avoid wrapping back to red
+            r, g, b = colorsys.hsv_to_rgb(hue, 1.0, 1.0)
+            colours.append(carla.Color(int(r * 255), int(g * 255), int(b * 255)))
 
-        # Draw next N waypoints from closest
-        for i in range(total_waypoints_to_draw):
-            idx = closest_idx + i
+        for i in range(n):
+            idx = self._waypoint_idx + i
             if idx >= len(self._waypoints):
                 break
             wp, _ = self._waypoints[idx]
-            colour = rainbow[i] if i < len(rainbow) else violet
             debug.draw_point(
                 wp.transform.location + carla.Location(z=0.5),
                 size=0.1,
-                color=colour,
+                color=colours[i],
                 life_time=0.1,
             )
 

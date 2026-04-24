@@ -1,5 +1,7 @@
 import os
 import sys
+import tty
+import termios
 import argparse
 import torch
 
@@ -63,9 +65,13 @@ def main():
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+    fd = sys.stdin.fileno()
+    old_settings = termios.tcgetattr(fd)
+
     env = CarlaEnv(run_tag=f"{args.algo}_eval")
 
     try:
+        tty.setcbreak(fd)
         cam_config = env.config['sensors']['camera']
         cam_res = cam_config['train_resolution']
         lidar_config = env.config['sensors']['lidar']
@@ -75,12 +81,13 @@ def main():
         obs_config = dict(
             camera_shape=(cam_config['channels'], cam_res['y'], cam_res['x']),
             lidar_shape=(lidar_config['channels'], lidar_res['y'], lidar_res['x']),
-            ego_state_dim=16,
+            ego_state_dim=6 + env.config['risk']['waypoints_ahead'] * 3,
             latent_dim=256,
             hidden_dim=128,
             n_reward_components=3,
             risk_feature_dim=env.risk_module.feature_dim,
         )
+        # Note: obs_config is kept here since evaluate_policy does not use TrainingSession.
 
         evaluator = PolicyEvaluator(
             algo=args.algo,
@@ -112,6 +119,7 @@ def main():
         Log.error(__file__, e)
 
     finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
         if env is not None:
             env.close()
 

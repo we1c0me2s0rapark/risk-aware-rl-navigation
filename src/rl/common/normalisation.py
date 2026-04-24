@@ -59,6 +59,8 @@ class RunningNormaliser:
         @param x np.ndarray New observation of shape matching self.shape.
         """
         x = np.asarray(x, dtype=np.float64).flatten()
+        if not np.isfinite(x).all():
+            x = np.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
         self.count += 1
         delta = x - self.mean
         self.mean += delta / self.count

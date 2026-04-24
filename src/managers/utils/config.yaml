@@ -11,18 +11,22 @@
 # @brief Parameters shared across all RL algorithms for fair comparison.
 # -----------------------------------------------------------------------------
 training:
-  total_steps: 500_000        # @brief Total environment steps for all algorithms (PPO, SAC, CVaR-SAC).
+  total_steps: 1_000_000      # @brief Total environment steps for all algorithms (PPO, SAC, CVaR-SAC).
 
 # -----------------------------------------------------------------------------
 # @section simulation Simulation settings
 # @brief Core parameters controlling simulation timing and execution behaviour.
 # -----------------------------------------------------------------------------
 simulation:
-  port: 2000                  # @brief TCP port used to connect to the CARLA server.
-  sync_mode: true             # @brief Enables synchronous simulation stepping mode.
-  dt: 0.05                    # @brief Fixed time step in seconds (simulation delta time).
-  max_episode_length: 2000    # @brief Maximum number of steps in an episode.
-  goal_threshold: 5.0         # @brief Distance threshold (metres) for reaching the goal.
+  port: 2000                    # @brief TCP port used to connect to the CARLA server.
+  sync_mode: true               # @brief Enables synchronous simulation stepping mode.
+  dt: 0.05                      # @brief Fixed time step in seconds (simulation delta time).
+  max_episode_length: 2000      # @brief Maximum number of steps in an episode.
+  goal_threshold: 5.0           # @brief Distance threshold (metres) for reaching the goal.
+  off_route_distance: 20.0      # @brief Distance threshold (metres) beyond which the episode terminates and off-route penalty is at maximum.
+  waypoint_advance_radius: 4.0  # @brief Distance threshold (metres) within which the next waypoint is considered reached.
+  min_route_distance: 50.0      # @brief Minimum straight-line distance (metres) between start and goal spawn points.
+  min_route_waypoints: 50       # @brief Minimum waypoints a valid route must have (2m spacing ≈ 100m of road).
 
 # ----------------------------------------------------------------------------- 
 # @section render Rendering settings
@@ -80,7 +84,7 @@ actions:
 # -----------------------------------------------------------------------------
 risk:
   top_k: 5                          # @brief Number of nearest agents considered in risk evaluation.
-  waypoints_ahead: 5                # @brief Number of future waypoints considered for path-based risk.
+  waypoints_ahead: 20               # @brief Number of future waypoints considered for path-based risk.
   search_radius: 50.0               # @brief Maximum search radius (metres) for nearby agents.
   ttc_sigma: 3.0                    # @brief Gaussian smoothing parameter for time-to-collision (TTC).
   ttc_max: 10.0                     # @brief Maximum TTC considered (seconds) for normalisation.
@@ -89,15 +93,16 @@ risk:
     walker: 2.5                     # @brief Weight assigned to pedestrian agents.
     cyclist: 1.8                    # @brief Weight assigned to cyclist agents.
   reward:
-    goal_progress_scale: 5.0        # @brief Multiplier for distance progress reward
-    heading_alignment_scale: 0.5    # @brief Weight for alignment with waypoint direction
-    wrong_way_penalty: 2.0          # @brief Penalty for driving against lane direction
+    goal_progress_scale: 10.0       # @brief Multiplier for distance progress reward
+    heading_alignment_scale: 2.0    # @brief Weight for alignment with waypoint direction
+    wrong_way_penalty: 2.5          # @brief Penalty for driving against lane direction
     speed_reward_scale: 0.1         # @brief Reward per m/s of forward speed
     speed_cap: 8.0                  # @brief Maximum speed (m/s) contributing to reward
     collision_penalty: 20.0         # @brief Penalty applied on collision
-    time_penalty: 0.01              # @brief Small per-step penalty to encourage efficiency
+    time_penalty: 0.5               # @brief Per-step penalty to discourage idling
     ttc_threshold: 3.0              # @brief TTC threshold (seconds) for risk-aware penalty
     ttc_penalty_scale: 1.0          # @brief Scaling factor for risk-based TTC penalty
+    off_route_penalty_scale: 2.5    # @brief Scaling factor for the quadratic off-route penalty applied to nav reward.
 
 # -----------------------------------------------------------------------------
 # @section ppo Proximal Policy Optimisation (PPO) settings
@@ -121,8 +126,9 @@ sac:
   batch_size: 256               # @brief Minibatch size for each SAC update.
   buffer_capacity: 500_000      # @brief Maximum number of transitions in the replay buffer.
   learning_starts: 1_000        # @brief Warm-up steps with random actions before training begins.
-  save_every: 1_000             # @brief Steps between checkpoint saves.
+  save_every: 10_000            # @brief Steps between checkpoint saves.
   log_every: 1_000              # @brief Steps between periodic log outputs.
+  update_every: 8               # @brief Steps between gradient updates after learning_starts.
 
 # -----------------------------------------------------------------------------
 # @section cvar_sac CVaR Soft Actor-Critic (CVaR-SAC) settings
@@ -136,3 +142,4 @@ cvar_sac:
   log_every: 1_000              # @brief Steps between periodic log outputs.
   n_quantiles: 32               # @brief Number of quantiles for the distributional critic.
   cvar_alpha: 0.1               # @brief CVaR confidence level (worst fraction of outcomes to optimise for).
+  update_every: 8               # @brief Steps between gradient updates after learning_starts.

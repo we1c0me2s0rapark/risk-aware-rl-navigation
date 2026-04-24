@@ -54,6 +54,11 @@ class SACAgent:
         # --- Initialise trainer ---
         self.trainer = SACTrainer(self.policy)
 
+        if hasattr(torch, 'compile'):
+            self.policy.critic = torch.compile(self.policy.critic)
+            self.policy.critic_target = torch.compile(self.policy.critic_target)
+            self.policy.actor = torch.compile(self.policy.actor)
+
     def act(self, obs: dict, deterministic: bool = False):
         """
         @brief Select an action using the current policy.

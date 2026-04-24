@@ -115,31 +115,23 @@ class SACTrainer:
         # Reduce decomposed reward to scalar [B]
         rewards = self._scalar_reward(rewards)
 
-        # ================================================================
-        # 1. Critic update
-        # ================================================================
+        # Encode each obs once; encoder is frozen (not in any optimiser)
         with torch.no_grad():
-            # Sample next action and log prob from current policy
-            next_action, next_log_prob, _ = self.policy.actor.sample(
-                self.policy._encode(next_obs)
-            )
-
-            # Compute target Q values using target critic
-            target_q1, target_q2 = self.policy.get_target_q_values(next_obs, next_action)
-
-            # Take minimum to prevent overestimation
+            next_latent = self.policy._encode(next_obs)
+            next_action, next_log_prob, _ = self.policy.actor.sample(next_latent)
+            target_q1, target_q2 = self.policy.critic_target(next_latent, next_action)
             target_q = torch.min(target_q1, target_q2).squeeze(-1)
-
-            # Entropy-regularised Bellman target
-            # y = r + γ(1 - done)(min Q(s', a') - α log π(a'|s'))
             target_q = rewards + self.gamma * (1.0 - dones) * (
                 target_q - self.alpha * next_log_prob.squeeze(-1)
             )
-            target_q = target_q.unsqueeze(-1) # [B, 1]
+            target_q = target_q.unsqueeze(-1)
 
-        # Current Q estimates
-        q1, q2 = self.policy.get_q_values(obs, actions)
+        obs_latent = self.policy._encode(obs).detach()
 
+        # ================================================================
+        # 1. Critic update
+        # ================================================================
+        q1, q2 = self.policy.critic(obs_latent, actions)
         critic_loss = F.mse_loss(q1, target_q) + F.mse_loss(q2, target_q)
 
         self.critic_optimiser.zero_grad()
@@ -149,14 +141,8 @@ class SACTrainer:
         # ================================================================
         # 2. Actor update
         # ================================================================
-        # Encode obs once, detach to prevent gradients flowing into encoder
-        # via the critic path (encoder is shared)
-        action_new, log_prob_new, latent = self.policy.evaluate(obs)
-
-        q1_new = self.policy.critic.q1_forward(latent, action_new)
-
-        # Actor loss: maximise Q(s,a) - α * log π(a|s)
-        # Equivalently minimise: α * log π(a|s) - Q(s,a)
+        action_new, log_prob_new, _ = self.policy.actor.sample(obs_latent)
+        q1_new = self.policy.critic.q1_forward(obs_latent, action_new)
         actor_loss = (self.alpha * log_prob_new - q1_new).mean()
 
         self.actor_optimiser.zero_grad()
@@ -166,7 +152,6 @@ class SACTrainer:
         # ================================================================
         # 3. Alpha (entropy temperature) update
         # ================================================================
-        # Minimise: -log α * (log π(a|s) + H_target)
         alpha_loss = -(
             self.log_alpha * (log_prob_new.detach() + self.target_entropy)
         ).mean()
@@ -174,8 +159,6 @@ class SACTrainer:
         self.alpha_optimiser.zero_grad()
         alpha_loss.backward()
         self.alpha_optimiser.step()
-
-        # Update alpha value
         self.alpha = self.log_alpha.exp().item()
 
         # ================================================================

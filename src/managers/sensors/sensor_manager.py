@@ -85,7 +85,7 @@ class SensorManager:
         cam_bp.set_attribute('image_size_x', str(cam_width))
         cam_bp.set_attribute('image_size_y', str(cam_height))
         self.camera_sensor = world.spawn_actor(
-            cam_bp, carla.Transform(carla.Location(x=1.5, z=2.4)), attach_to=vehicle
+            cam_bp, carla.Transform(carla.Location(x=-6.0, z=3.5), carla.Rotation(pitch=-15.0)), attach_to=vehicle
         )
         self.camera_sensor.listen(lambda image: self.camera_callback(image))
 

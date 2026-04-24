@@ -95,6 +95,9 @@ class CVaRSACTrainer(SACTrainer):
         ).to(policy.device)
         self.register_taus(taus)
 
+        self._use_amp = False  # small batch (256) is kernel-launch-bound, not compute-bound
+        self.scaler = torch.amp.GradScaler('cuda', enabled=False)
+
     def register_taus(self, taus: torch.Tensor):
         """
         @brief Store quantile levels as a non-trainable buffer.
@@ -175,62 +178,55 @@ class CVaRSACTrainer(SACTrainer):
         # Reduce decomposed reward to scalar [B]
         rewards = self._scalar_reward(rewards)
 
-        # ================================================================
-        # 1. Distributional critic update
-        # ================================================================
+        # Encode each observation once. The encoder is shared but not in any
+        # optimiser, so detaching avoids backprop through frozen weights.
         with torch.no_grad():
-            # Sample next action and log prob from current policy
-            next_action, next_log_prob, _ = self.policy.actor.sample(
-                self.policy._encode(next_obs)
-            )
-
-            # Get target quantile distributions
-            target_z1, target_z2 = self.policy.get_target_q_values(next_obs, next_action)
-
-            # Quantile-wise minimum to prevent overestimation [B, N]
+            next_latent = self.policy._encode(next_obs)
+            next_action, next_log_prob, _ = self.policy.actor.sample(next_latent)
+            target_z1, target_z2 = self.policy.critic_target(next_latent, next_action)
             target_z = torch.min(target_z1, target_z2)
-
-            # next_log_prob: [B, 1] → reshape to [B, 1] for clean broadcast against [B, N]
-            entropy_term = (self.alpha * next_log_prob).expand_as(target_z) # [B, N]
-
+            entropy_term = (self.alpha * next_log_prob).expand_as(target_z)
             target_z = (
                 rewards.unsqueeze(1) +
                 self.gamma * (1.0 - dones.unsqueeze(1)) * (target_z - entropy_term)
             )
 
-        # Current quantile predictions
-        z1, z2 = self.policy.get_q_values(obs, actions)
+        obs_latent = self.policy._encode(obs).detach()
 
-        # Quantile regression loss for both networks
-        critic_loss = (
-            self._quantile_regression_loss(z1, target_z.detach()) +
-            self._quantile_regression_loss(z2, target_z.detach())
-        )
+        # ================================================================
+        # 1. Distributional critic update
+        # ================================================================
+        with torch.autocast('cuda', dtype=torch.float16, enabled=self._use_amp):
+            z1, z2 = self.policy.critic(obs_latent, actions)
+            critic_loss = (
+                self._quantile_regression_loss(z1, target_z) +
+                self._quantile_regression_loss(z2, target_z)
+            )
 
         self.critic_optimiser.zero_grad()
-        critic_loss.backward()
-        self.critic_optimiser.step()
+        self.scaler.scale(critic_loss).backward()
+        self.scaler.step(self.critic_optimiser)
 
         # ================================================================
         # 2. CVaR actor update
         # ================================================================
-        action_new, log_prob_new, latent = self.policy.evaluate(obs)
-
-        # CVaR_α(Z1) - expected return in worst α fraction of outcomes
-        cvar = self.policy.critic.cvar(latent, action_new, alpha=self.policy.cvar_alpha)
-
-        # Actor loss: maximise CVaR - α*log_π (minimise negative CVaR + entropy cost)
-        actor_loss = (self.alpha * log_prob_new - cvar).mean()
+        # Reuse obs_latent (already detached — matches evaluate() semantics)
+        with torch.autocast('cuda', dtype=torch.float16, enabled=self._use_amp):
+            action_new, log_prob_new, _ = self.policy.actor.sample(obs_latent)
+            cvar = self.policy.critic.cvar(obs_latent, action_new, alpha=self.policy.cvar_alpha)
+            actor_loss = (self.alpha * log_prob_new - cvar).mean()
 
         self.actor_optimiser.zero_grad()
-        actor_loss.backward()
-        self.actor_optimiser.step()
+        self.scaler.scale(actor_loss).backward()
+        self.scaler.step(self.actor_optimiser)
+
+        self.scaler.update()
 
         # ================================================================
-        # 3. Alpha update (inherited from SACTrainer - unchanged)
+        # 3. Alpha update — kept in fp32 for numerical stability
         # ================================================================
         alpha_loss = -(
-            self.log_alpha * (log_prob_new.detach() + self.target_entropy)
+            self.log_alpha * (log_prob_new.detach().float() + self.target_entropy)
         ).mean()
 
         self.alpha_optimiser.zero_grad()

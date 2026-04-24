@@ -16,53 +16,14 @@ try:
     from managers.utils.logger import Log
     from rl.common.checkpoint import CheckpointManager
     from rl.common.normalisation import ObservationNormaliser
+    from rl.common.preprocessing import preprocess_obs
+    from carla_client.utilities import is_q_pressed
 except ImportError as e:
     print(f"[ERROR at {os.path.basename(__file__)}] {e}")
     sys.exit(1)
 
 SUPPORTED_ALGOS = ("ppo", "sac", "cvar_sac")
 
-def _preprocess_obs(obs: dict, config: dict, device: torch.device) -> dict:
-    """
-    @brief Preprocess raw CARLA observations into batched torch tensors.
-
-    @details
-    Converts camera, LiDAR, ego state, and risk features from raw numpy
-    arrays into normalised float32 tensors suitable for policy inference.
-    LiDAR points are projected into a 2D bird's-eye-view occupancy grid.
-
-    @param obs dict Raw observation dictionary from the CARLA environment.
-    @param config dict Environment configuration specifying sensor properties.
-    @param device torch.device Target device for the output tensors.
-    @return dict Batched tensors with keys: camera, lidar, ego_state, risk_features.
-    """
-
-    cam_cfg = config['sensors']['camera']
-    cam_res = cam_cfg['train_resolution']
-    channels = cam_cfg['channels']
-    camera = np.array(obs["camera"], dtype=np.float32).reshape(channels, cam_res['y'], cam_res['x'])
-
-    lidar_cfg = config['sensors']['lidar']
-    lidar_res = lidar_cfg['train_resolution']
-    lidar_range = lidar_cfg['range']
-    pts = np.array(obs["lidar"], dtype=np.float32).reshape(-1, 3)
-    grid_h, grid_w = lidar_res['y'], lidar_res['x']
-    lidar_bev = np.zeros((grid_h, grid_w), dtype=np.float32)
-    x_px = (((pts[:, 0] / lidar_range) + 1) / 2 * (grid_w - 1)).astype(np.int32)
-    y_px = (((pts[:, 1] / lidar_range) + 1) / 2 * (grid_h - 1)).astype(np.int32)
-    mask = (x_px >= 0) & (x_px < grid_w) & (y_px >= 0) & (y_px < grid_h)
-    lidar_bev[y_px[mask], x_px[mask]] = 1.0
-    lidar = lidar_bev[np.newaxis, :, :]
-
-    ego_state = np.array(obs["ego_state"], dtype=np.float32).flatten()
-    risk_features = np.array(obs["risk_features"], dtype=np.float32).flatten()
-
-    return {
-        "camera": torch.tensor(camera, dtype=torch.float32, device=device).unsqueeze(0),
-        "lidar": torch.tensor(lidar, dtype=torch.float32, device=device).unsqueeze(0),
-        "ego_state": torch.tensor(ego_state, dtype=torch.float32, device=device).unsqueeze(0),
-        "risk_features": torch.tensor(risk_features, dtype=torch.float32, device=device).unsqueeze(0),
-    }
 
 def _extract_camera_frame(obs: dict, config: dict) -> np.ndarray:
     """
@@ -160,7 +121,7 @@ class PolicyEvaluator:
         """
 
         manager = CheckpointManager(parent_dir=checkpoint_dir, ws_dir=self.algo)
-        count = manager.load(self.agent)
+        count = manager.load(self.agent, self.obs_normaliser)
 
         self.agent.policy.encoder.eval()
         self.agent.policy.actor.eval()
@@ -226,6 +187,10 @@ class PolicyEvaluator:
         wp_completions, total_rewards, ep_lengths = [], [], []
 
         for ep in range(n_episodes):
+            if is_q_pressed():
+                Log.info(__file__, "'q' pressed - stopping evaluation early.")
+                break
+
             obs = env.reset()
             ep_reward = np.zeros(3)
             steps = 0
@@ -233,7 +198,7 @@ class PolicyEvaluator:
 
             while not done:
                 self.obs_normaliser.update(obs)
-                obs_tensor = _preprocess_obs(obs, env.config, self.device)
+                obs_tensor = preprocess_obs(obs, env.config, self.device)
                 obs_tensor = self.obs_normaliser.normalise(obs_tensor)
 
                 action = self._select_action(obs_tensor, deterministic)
@@ -265,7 +230,8 @@ class PolicyEvaluator:
             total_rewards.append(ep_reward)
             ep_lengths.append(steps)
 
-            status = "GOAL" if goal_reached else ("COLLISION" if collision else "TIMEOUT")
+            off_route = info.get('off_route', False)
+            status = "GOAL" if goal_reached else ("COLLISION" if collision else ("OFF-ROUTE" if off_route else "TIMEOUT"))
             Log.info(__file__,
                 f"Ep {ep+1:>3}/{n_episodes} [{status:<9}] "
                 f"steps: {steps:>4} | "

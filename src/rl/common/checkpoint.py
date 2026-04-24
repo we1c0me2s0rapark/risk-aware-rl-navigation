@@ -48,13 +48,17 @@ class CheckpointManager:
         """
         return hasattr(agent.trainer, 'actor_optimiser')
 
-    def save(self, agent, count: int):
+    def save(self, agent, count: int, obs_normaliser=None):
         """
         @brief Save the agent's state to disk.
 
         @param agent PPOAgent or SACAgent instance.
         @param count int Rollout count (PPO) or step count (SAC).
+        @param obs_normaliser ObservationNormaliser Optional normaliser whose running
+               stats should be saved alongside the agent weights.
         """
+        normaliser_state = obs_normaliser.state_dict() if obs_normaliser is not None else None
+
         if self._is_sac(agent):
             torch.save({
                 'step_count':       count,
@@ -65,33 +69,40 @@ class CheckpointManager:
                 'critic_optimiser': agent.trainer.critic_optimiser.state_dict(),
                 'alpha_optimiser':  agent.trainer.alpha_optimiser.state_dict(),
                 'log_alpha':        agent.trainer.log_alpha,
+                'obs_normaliser':   normaliser_state,
             }, self.path)
             Log.info(__file__, f"💾 SAC checkpoint saved at step {count} → {self.path}")
         else:
             torch.save({
-                'rollout_count': count,
-                'encoder':       agent.policy.encoder.state_dict(),
-                'actor':         agent.policy.actor.state_dict(),
-                'critic':        agent.policy.critic.state_dict(),
-                'optimiser':     agent.trainer.optimiser.state_dict(),
+                'rollout_count':  count,
+                'encoder':        agent.policy.encoder.state_dict(),
+                'actor':          agent.policy.actor.state_dict(),
+                'critic':         agent.policy.critic.state_dict(),
+                'optimiser':      agent.trainer.optimiser.state_dict(),
+                'obs_normaliser': normaliser_state,
             }, self.path)
             Log.info(__file__, f"💾 PPO checkpoint saved at rollout {count} → {self.path}")
 
-    def load(self, agent) -> int:
+    def load(self, agent, obs_normaliser=None) -> int:
         """
         @brief Load the agent's state from disk if a checkpoint exists.
 
         @param agent PPOAgent or SACAgent instance.
+        @param obs_normaliser ObservationNormaliser Optional normaliser to restore
+               running stats from the checkpoint.
         @return int Rollout count (PPO) or step count (SAC), or 0 if no checkpoint.
         """
         if not os.path.exists(self.path):
             Log.info(__file__, f"No checkpoint found at {self.path} - starting from scratch.")
             return 0
 
-        ckpt = torch.load(self.path, map_location=agent.device)
+        ckpt = torch.load(self.path, map_location=agent.device, weights_only=False)
         agent.policy.encoder.load_state_dict(ckpt['encoder'])
         agent.policy.actor.load_state_dict(ckpt['actor'])
         agent.policy.critic.load_state_dict(ckpt['critic'])
+
+        if obs_normaliser is not None and ckpt.get('obs_normaliser') is not None:
+            obs_normaliser.load_state_dict(ckpt['obs_normaliser'])
 
         if self._is_sac(agent):
             agent.trainer.actor_optimiser.load_state_dict(ckpt['actor_optimiser'])
