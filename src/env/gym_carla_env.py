@@ -146,10 +146,12 @@ class CarlaEnv(gym.Env):
         self.vehicle = None
         self.collision_history = []
         self.episode_length = 0
-        
+
         self._risk_vec = None
         self._ego = None
         self._agents = None
+        self._blend_alpha = 0.0
+        self._stopping = False
 
         self._destination = None
         self._prev_dist_to_goal = None
@@ -241,6 +243,8 @@ class CarlaEnv(gym.Env):
         self._risk_vec = None
         self._ego = None
         self._agents = None
+        self._blend_alpha = 0.0
+        self._stopping = False
 
         self._setup_sensors()
 
@@ -275,7 +279,18 @@ class CarlaEnv(gym.Env):
 
         self.episode_length += 1
 
-        steer, throttle, brake = self._apply_control(action)
+        # Trigger stopping sequence once the route is complete
+        if self._goal_reached() and not self._stopping:
+            self._stopping = True
+
+        if self._stopping:
+            # Brake to a halt — override RL and controller
+            self.vehicle.apply_control(carla.VehicleControl(throttle=0.0, brake=1.0, steer=0.0))
+            steer, throttle, brake = 0.0, 0.0, 1.0
+            self._blend_alpha = 0.0
+        else:
+            steer, throttle, brake = self._apply_control(action)
+
         self.world.tick()
 
         self._draw_waypoints()
@@ -345,16 +360,19 @@ class CarlaEnv(gym.Env):
         if self._check_collision():
             Log.warning(__file__, f"Collision detected with {len(self.collision_history)} events")
 
+        velocity = self.vehicle.get_velocity()
+        fully_stopped = self._stopping and math.hypot(velocity.x, velocity.y) < 0.5
+
         done = (
             self._check_collision() or
-            self._goal_reached() or
+            fully_stopped or
             self._timeout() or
             self._off_route()
         )
 
         info = {
             'collision': self._check_collision(),
-            'goal_reached': self._goal_reached(),
+            'goal_reached': fully_stopped,
             'off_route': self._off_route(),
             'ttc_min': float(min(
                 (self._risk_vec[i * AGENT_FEAT_DIM + 4] for i in range(self.risk_module.top_k)
@@ -368,6 +386,7 @@ class CarlaEnv(gym.Env):
             'reward_risk': rewards[2],
             'wp_idx': self._waypoint_idx,
             'wp_total': len(self._waypoints), # route completion = wp_idx / wp_total
+            'blend_alpha': self._blend_alpha,  # 0=controller, 1=RL agent
         }
 
         speed = np.sqrt(self._ego['vx']**2 + self._ego['vy']**2)
@@ -382,54 +401,127 @@ class CarlaEnv(gym.Env):
 
         return obs, reward, done, info
         
-    def _apply_control(self, action) -> list[float]:
+    def _apply_control(self, action) -> tuple[float, float, float]:
         """
-        @brief Convert the policy action into CARLA control commands.
- 
+        @brief Blend the RL action with the waypoint-follower baseline and apply it.
+
         @details
-        Accepts both NumPy arrays and torch tensors. Actions are squashed
-        using tanh to enforce valid ranges:
-            - steer ∈ [-1, 1]
-            - throttle ∈ [0, 1]
-            - brake ∈ [0, 1]
- 
-        Throttle and brake are treated as mutually exclusive.
- 
-        @param action torch.Tensor | numpy.ndarray Raw action input
-        @return list[float] Applied control values [steer, throttle, brake]
+        Decodes the raw RL action from tanh-space to physical control space,
+        then blends it with the pure-pursuit controller output using a
+        risk-driven factor α:
+
+            final = (1 - α) * controller + α * rl_action
+
+        α = 0  → full waypoint follower (no risk)
+        α = 1  → full RL agent (high risk / short TTC)
+
+        @param action torch.Tensor | numpy.ndarray Raw RL action [steer, throttle, brake]
+        @return tuple[float, float, float] Applied (steer, throttle, brake)
         """
 
-        # --- Convert to numpy ---
+        # --- Decode RL action from tanh-space to physical space ---
         if isinstance(action, torch.Tensor):
             action = action.detach().cpu().numpy()
-
-        # If batch dimension exists → take first element
         if action.ndim > 1:
             action = action[0]
-
-        # --- Squash to valid range ---
         action = np.tanh(action)
+        rl_steer    = float(action[0])
+        rl_throttle = float((action[1] + 1) / 2)
+        rl_brake    = float((action[2] + 1) / 2)
 
-        steer = float(action[0])                # [-1, 1]
-        throttle = float((action[1] + 1) / 2)   # [0, 1]
-        brake = float((action[2] + 1) / 2)      # [0, 1]
+        # --- Waypoint-follower baseline ---
+        ctrl_steer, ctrl_throttle, ctrl_brake = self._compute_controller_action()
 
-        # --- Enforce mutual exclusivity ---
+        # --- Risk-driven blend ---
+        alpha = self._compute_blend_alpha()
+        self._blend_alpha = alpha   # expose for info dict
+
+        steer    = (1.0 - alpha) * ctrl_steer    + alpha * rl_steer
+        throttle = (1.0 - alpha) * ctrl_throttle + alpha * rl_throttle
+        brake    = (1.0 - alpha) * ctrl_brake    + alpha * rl_brake
+
+        # --- Mutual exclusivity ---
         if throttle > 0.05:
             brake = 0.0
         elif brake > 0.05:
             throttle = 0.0
 
-        # --- Apply control ---
         self.vehicle.apply_control(carla.VehicleControl(
-            steer=steer,
-            throttle=throttle,
-            brake=brake
+            steer=steer, throttle=throttle, brake=brake
         ))
 
-        # Log.info(__file__, f"raw action: {action}, throttle: {throttle:.3f}, brake: {brake:.3f}")
+        return steer, throttle, brake
+
+    def _compute_controller_action(self) -> tuple[float, float, float]:
+        """
+        @brief Pure-pursuit waypoint follower returning a physical control action.
+
+        @details
+        Steering is computed as the signed angle from the vehicle heading to
+        the current target waypoint, normalised by the maximum CARLA steer
+        angle (0.7 rad ≈ 40°).
+
+        Throttle and brake are set by a proportional speed controller that
+        targets speed_cap (m/s) from the reward config.
+
+        @return tuple[float, float, float] (steer, throttle, brake) in [−1,1] / [0,1] / [0,1]
+        """
+
+        if not self._waypoints or self._waypoint_idx >= len(self._waypoints):
+            return 0.0, 0.0, 1.0   # no route: hold brakes
+
+        tf = self.vehicle.get_transform()
+        target_wp = self._waypoints[self._waypoint_idx][0]
+
+        # Pure-pursuit steering: angle to waypoint normalised by max steer (0.7 rad)
+        steer_angle = self.vehicle_manager.calculate_steering_to_waypoint(tf, target_wp)
+        steer = float(np.clip(steer_angle / 0.7, -1.0, 1.0))
+
+        # Proportional speed controller
+        velocity = self.vehicle.get_velocity()
+        speed = math.hypot(velocity.x, velocity.y)
+        target_speed = self.config['risk']['reward']['speed_cap']
+        error = target_speed - speed
+        if error > 0:
+            throttle = float(min(1.0, error / target_speed))
+            brake = 0.0
+        else:
+            throttle = 0.0
+            brake = float(min(1.0, -error / target_speed))
 
         return steer, throttle, brake
+
+    def _compute_blend_alpha(self) -> float:
+        """
+        @brief Compute the risk-driven blending factor α ∈ [0, 1].
+
+        @details
+        α rises linearly from 0 to 1 as the minimum TTC among nearby
+        agents drops from ttc_threshold to 0:
+
+            α = max(0, 1 − ttc_min / ttc_threshold)
+
+        α = 0  → no agents nearby, waypoint follower drives
+        α = 1  → imminent collision, RL agent has full control
+
+        @return float Blend factor in [0, 1].
+        """
+
+        if self._risk_vec is None:
+            return 0.0
+
+        ttc_threshold = self.config['risk']['reward']['ttc_threshold']
+        ttc_min = min(
+            (self._risk_vec[i * AGENT_FEAT_DIM + 4]
+             for i in range(self.risk_module.top_k)
+             if self._risk_vec[i * AGENT_FEAT_DIM] > 0),
+            default=float('inf')
+        )
+
+        if ttc_min == float('inf'):
+            return 0.0
+
+        return float(max(0.0, 1.0 - ttc_min / ttc_threshold))
 
     def _check_collision(self) -> bool:
         """
