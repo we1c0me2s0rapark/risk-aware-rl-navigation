@@ -17,7 +17,7 @@ try:
     from rl.algorithms.cvar_sac.cvar_sac_trainer import CVaRSACTrainer
     from rl.algorithms.cvar_sac.cvar_sac_policy import CVaRSACPolicy
 except ImportError as e:
-    Log.error(__file__, e)
+    print(f"[ERROR at {os.path.basename(__file__)}] {e}")
 
 class CVaRSACAgent:
     """
@@ -72,6 +72,13 @@ class CVaRSACAgent:
 
         # --- CVaR trainer ---
         self.trainer = CVaRSACTrainer(self.policy)
+
+        # Compile hot paths with TorchInductor to fuse CUDA kernels.
+        # First update will be slow (compilation), subsequent ones are faster.
+        if hasattr(torch, 'compile'):
+            self.policy.critic = torch.compile(self.policy.critic)
+            self.policy.critic_target = torch.compile(self.policy.critic_target)
+            self.policy.actor = torch.compile(self.policy.actor)
 
     def act(self, obs: dict, deterministic: bool = False) -> tuple[torch.Tensor, torch.Tensor]:
         """

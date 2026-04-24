@@ -21,7 +21,7 @@ try:
     from rl.models.critic import PPOCritic
     from rl.models.encoders import ObservationEncoder
 except ImportError as e:
-    Log.error(__file__, e)
+    print(f"[ERROR at {os.path.basename(__file__)}] {e}")
 
 
 class PPOPolicy(Policy):

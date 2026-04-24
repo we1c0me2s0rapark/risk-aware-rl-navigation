@@ -5,7 +5,7 @@ import yaml
 try:
     from .logger import Log
 except ImportError as e:
-    Log.error(__file__, e)
+    print(f"[ERROR at {os.path.basename(__file__)}] {e}")
 
 def load_config():
     """

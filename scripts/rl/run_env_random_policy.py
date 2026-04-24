@@ -1,9 +1,6 @@
 import os
 import sys
-import gym
 import time
-import numpy as np
-from datetime import datetime
 
 try:
     # Allow importing from the src directory
@@ -14,7 +11,7 @@ try:
     from env import CarlaEnv
     from managers.utils.logger import Log
 except ImportError as e:
-    Log.error(__file__, e)
+    print(f"[ERROR at {os.path.basename(__file__)}] {e}")
 
 
 def main():

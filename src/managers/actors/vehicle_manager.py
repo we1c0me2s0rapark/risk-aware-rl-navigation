@@ -39,31 +39,31 @@ class VehicleManager:
         self.blueprint_library = world.get_blueprint_library()
         self.vehicles: List[VehicleState] = []
 
-    def spawn_ego_vehicle(self, vehicle_filter: str = "vehicle.tesla.model3", spawn_index: int = 0, set_physics: bool = False) -> Optional[carla.Vehicle]:
+    def spawn_ego_vehicle(self, vehicle_filter: str = "vehicle.tesla.model3", spawn_index: int = 0, set_physics: bool = False, transform: 'carla.Transform' = None) -> Optional[carla.Vehicle]:
         """
         @brief Spawn an ego vehicle in the CARLA world.
 
         @param vehicle_filter Blueprint filter string for the desired model.
-        @param spawn_index The index of the map spawn point to utilise.
+        @param spawn_index The index of the map spawn point to utilise (ignored if transform is given).
+        @param transform Optional explicit transform to spawn at (e.g. a waypoint transform).
         @return The spawned carla.Vehicle instance, or None if the operation fails.
         """
-        spawn_points = self.world.get_map().get_spawn_points()
-        if not spawn_points:
-            print("No spawn points available in the current map.")
-            return None
-
-        if spawn_index >= len(spawn_points):
-            print(f"Spawn index {spawn_index} is out of range. Defaulting to index 0.")
-            spawn_index = 0
-
         blueprints = self.blueprint_library.filter(vehicle_filter)
         if not blueprints:
             print(f"No vehicle blueprint found for filter: {vehicle_filter}")
             return None
 
+        if transform is None:
+            spawn_points = self.world.get_map().get_spawn_points()
+            if not spawn_points:
+                print("No spawn points available in the current map.")
+                return None
+            if spawn_index >= len(spawn_points):
+                print(f"Spawn index {spawn_index} is out of range. Defaulting to index 0.")
+                spawn_index = 0
+            transform = spawn_points[spawn_index]
+
         blueprint = blueprints[0]
-        transform = spawn_points[spawn_index]
-        
         vehicle = self.world.try_spawn_actor(blueprint, transform)
         if vehicle:
             vehicle_state = VehicleState(

@@ -3,9 +3,6 @@ import sys
 import tty
 import termios
 import carla
-import random
-import time
-import numpy as np
 
 try:
     # Allow importing from the src directory
@@ -19,7 +16,7 @@ try:
     from managers.actors import VehicleManager
     from managers.sensors import SensorVisualiser
 except ImportError as e:
-    print(f"[{__name__}] Error: {e}")
+    print(f"[ERROR at {os.path.basename(__file__)}] {e}")
 
 def main():
     """
