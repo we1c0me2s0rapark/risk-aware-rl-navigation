@@ -28,7 +28,7 @@ try:
     from reward import decomposed_reward, baseline_reward
     from agents.navigation.global_route_planner import GlobalRoutePlanner
     from carla_client.connection import connect_carla, configure_simulation
-    from managers.actors import VehicleManager
+    from managers.actors import VehicleManager, NPCManager
     from managers.sensors import SensorManager
     from managers.utils.config_manager import load_config
     from managers.utils.logger import Log
@@ -141,17 +141,27 @@ class CarlaEnv(gym.Env):
         self.max_episode_length = sim_config['max_episode_length']
         self.vehicle_manager = VehicleManager(self.world)
         self.sensor_manager = SensorManager()
+        self.npc_manager = NPCManager(self.world, self.client)
+
+        # --- Reproducibility ---
+        self._base_seed = self.config.get('training', {}).get('seed', 42)
+        self._episode_count = 0
 
         # --- Internal state ---
         self.vehicle = None
         self.collision_history = []
         self.episode_length = 0
-
+        self._route_dists = []
+        self._wheelbase = 2.5  # updated after spawn via get_wheelbase()
+        self._route_dists = []  # cumulative arc distances, rebuilt each episode
+        self._ctrl_target_loc = None  # lookahead waypoint location used by controller, for viz
         self._risk_vec = None
         self._ego = None
         self._agents = None
         self._blend_alpha = 0.0
         self._stopping = False
+        self._prev_control = np.zeros(3)  # [steer, throttle, brake]
+        self._stuck_steps = 0
 
         self._destination = None
         self._prev_dist_to_goal = None
@@ -195,6 +205,12 @@ class CarlaEnv(gym.Env):
 
         self._cleanup_actors()
 
+        # Per-episode RNG: episode N always gets the same environment regardless
+        # of which algorithm is running or how many steps prior episodes took.
+        episode_seed = self._base_seed + self._episode_count
+        episode_rng = random.Random(episode_seed)
+        self._episode_count += 1
+
         # Spawn at a pre-validated CARLA spawn point (always accepted), then
         # snap _waypoint_idx to the closest route waypoint so navigation and
         # visualisation are aligned with the vehicle's actual spawn location.
@@ -206,22 +222,35 @@ class CarlaEnv(gym.Env):
 
         self.vehicle = None
         for _ in range(20):
-            start_sp = random.choice(spawn_points)
+            start_sp = episode_rng.choice(spawn_points)
             candidates = [sp for sp in spawn_points if start_sp.location.distance(sp.location) >= min_dist]
-            end_loc = random.choice(candidates if candidates else spawn_points).location
+            end_loc = episode_rng.choice(candidates if candidates else spawn_points).location
 
             self._waypoints = grp.trace_route(start_sp.location, end_loc)
-            self._destination = end_loc
             self._dist_to_wp = 0.0
 
             # Reject routes that are too short to be meaningful
             if len(self._waypoints) < min_waypoints:
                 continue
 
+            # Anchor the goal marker to the actual last waypoint, not the raw
+            # spawn point used as the routing target (they can differ by metres).
+            self._destination = self._waypoints[-1][0].transform.location
+
+            # Reject routes whose first waypoint heads the opposite way to the
+            # spawn point. This prevents the vehicle from spawning in the
+            # oncoming lane relative to the route it is meant to follow.
+            first_wp_fwd = self._waypoints[0][0].transform.get_forward_vector()
+            spawn_fwd = start_sp.get_forward_vector()
+            if first_wp_fwd.x * spawn_fwd.x + first_wp_fwd.y * spawn_fwd.y < 0.0:
+                continue
+
             # Find _waypoint_idx from start_sp before spawning so the vehicle
             # lands at the same position as the navigation target.
+            # require_road_alignment ensures we snap to a same-direction waypoint.
             self._waypoint_idx, self._prev_dist_to_goal = self._find_closest_waypoint_ahead(
-                transform=start_sp
+                transform=start_sp,
+                require_road_alignment=True,
             )
 
             # Reject if the snap puts us too close to the end of the route
@@ -237,16 +266,47 @@ class CarlaEnv(gym.Env):
         if self.vehicle is None:
             raise RuntimeError("Failed to find a valid spawnable route after 20 attempts")
 
+        self._wheelbase = self.vehicle_manager.get_wheelbase(self.vehicle)
+
+        self._route_dists = [0.0]
+        for _i in range(1, len(self._waypoints)):
+            _a = self._waypoints[_i - 1][0].transform.location
+            _b = self._waypoints[_i][0].transform.location
+            self._route_dists.append(
+                self._route_dists[-1] + math.hypot(_b.x - _a.x, _b.y - _a.y)
+            )
+
         self.episode_length = 0
         self.collision_history = []
 
+        self._ctrl_target_loc = None
         self._risk_vec = None
         self._ego = None
         self._agents = None
         self._blend_alpha = 0.0
         self._stopping = False
+        self._prev_control = np.zeros(3)
+        self._stuck_steps = 0
 
         self._setup_sensors()
+
+        sim = self.config['simulation']
+        self.npc_manager.spawn(
+            num_vehicles=sim.get('num_npc_vehicles', 5),
+            ego_location=self.vehicle.get_location(),
+            min_distance=sim.get('min_npc_distance', 15.0),
+            tm_port=sim.get('tm_port', 8000),
+            sync_mode=sim['sync_mode'],
+            rng=episode_rng,
+            seed=episode_seed,
+        )
+        self.npc_manager.spawn_static_on_route(
+            waypoints=self._waypoints,
+            from_idx=self._waypoint_idx,
+            num_obstacles=sim.get('num_static_obstacles', 3),
+            min_gap=sim.get('static_obstacle_min_gap', 20),
+            rng=episode_rng,
+        )
 
         self.world.tick()
 
@@ -299,15 +359,15 @@ class CarlaEnv(gym.Env):
         self._ego = self._get_ego_state()
         self._agents = self._get_nearby_actors()
 
-        # Waypoint direction
-        target = self._get_next_waypoint()
-        dx = target.x - self._ego['x']
-        dy = target.y - self._ego['y']
-        dist = max(np.sqrt(dx**2 + dy**2), 1e-6)
-        wp_dx, wp_dy = dx / dist, dy / dist
+        # Route forward direction at the current waypoint.
+        # Using the waypoint's own forward vector (lane direction) rather than
+        # the bearing to the waypoint location gives a stable turn signal: it is
+        # +1 when the vehicle faces along the lane and becomes negative as soon as
+        # it diverges — even before it has moved away from the waypoint position.
+        route_fwd = self._waypoints[self._waypoint_idx][0].transform.get_forward_vector()
+        wp_dx, wp_dy = float(route_fwd.x), float(route_fwd.y)
 
         # Risk and Reward logic
-        WRONG_WAY_THRESHOLD = 0.5
         wrong_way_risk = self._compute_wrong_way_risk()
 
         self._risk_vec = self.risk_module.compute(
@@ -352,6 +412,11 @@ class CarlaEnv(gym.Env):
         off_route_penalty = (normalised_dist ** 2) * self.config['risk']['reward']['off_route_penalty_scale']
         rewards[0] -= off_route_penalty
 
+        # Linear cross-track penalty: constant gradient regardless of deviation size,
+        # so the agent always has a signal to return toward the route centerline.
+        cross_track_penalty = normalised_dist * self.config['risk']['reward'].get('cross_track_scale', 1.0)
+        rewards[0] -= cross_track_penalty
+
         reward = rewards
 
         # Construct observation
@@ -361,18 +426,34 @@ class CarlaEnv(gym.Env):
             Log.warning(__file__, f"Collision detected with {len(self.collision_history)} events")
 
         velocity = self.vehicle.get_velocity()
-        fully_stopped = self._stopping and math.hypot(velocity.x, velocity.y) < 0.5
+        speed = math.hypot(velocity.x, velocity.y)
+        fully_stopped = self._stopping and speed < 0.5
+
+        # A vehicle stopped under high risk (RL is meaningfully in control) is
+        # waiting deliberately for a gap — not stuck. Suspend the stuck counter
+        # and refund the time penalty so the RL can learn that waiting is valid.
+        risk_stop = self._blend_alpha >= self.config['simulation'].get('risk_stop_threshold', 0.3) and speed < 0.5
+        if not self._stopping and not risk_stop and speed < 0.5:
+            self._stuck_steps += 1
+        else:
+            self._stuck_steps = 0
+        stuck = self._stuck_steps >= self.config['simulation'].get('stuck_timeout', 100)
+
+        if risk_stop:
+            rewards[0] += self.config['risk']['reward']['time_penalty']
 
         done = (
             self._check_collision() or
             fully_stopped or
             self._timeout() or
-            self._off_route()
+            self._off_route() or
+            stuck
         )
 
         info = {
             'collision': self._check_collision(),
             'goal_reached': fully_stopped,
+            'stuck': stuck,
             'off_route': self._off_route(),
             'ttc_min': float(min(
                 (self._risk_vec[i * AGENT_FEAT_DIM + 4] for i in range(self.risk_module.top_k)
@@ -433,18 +514,38 @@ class CarlaEnv(gym.Env):
         ctrl_steer, ctrl_throttle, ctrl_brake = self._compute_controller_action()
 
         # --- Risk-driven blend ---
-        alpha = self._compute_blend_alpha()
-        self._blend_alpha = alpha   # expose for info dict
+        # EMA-smooth alpha so the blend regime shifts gradually rather than
+        # snapping — prevents a sudden nearby car from instantly handing full
+        # control to the (potentially erratic) RL policy.
+        alpha_raw = self._compute_blend_alpha()
+        alpha_smooth = self.config['simulation'].get('alpha_smoothing', 0.7)
+        alpha = alpha_smooth * self._blend_alpha + (1.0 - alpha_smooth) * alpha_raw
+        # Cap alpha so the controller always retains a stabilising contribution.
+        alpha = min(alpha, self.config['simulation'].get('max_blend_alpha', 0.5))
+        self._blend_alpha = alpha
 
         steer    = (1.0 - alpha) * ctrl_steer    + alpha * rl_steer
         throttle = (1.0 - alpha) * ctrl_throttle + alpha * rl_throttle
         brake    = (1.0 - alpha) * ctrl_brake    + alpha * rl_brake
 
-        # --- Mutual exclusivity ---
-        if throttle > 0.05:
-            brake = 0.0
-        elif brake > 0.05:
+        # --- EMA smoothing on steer and throttle to prevent sudden jumps.
+        # Steer uses a lower coefficient so the controller can respond quickly
+        # to turns; throttle uses a higher coefficient to suppress speed oscillation.
+        # Brake is not smoothed so emergency stops respond immediately.
+        steer_smooth    = self.config['simulation'].get('steer_smoothing', 0.3)
+        throttle_smooth = self.config['simulation'].get('throttle_smoothing', 0.7)
+        steer    = steer_smooth    * self._prev_control[0] + (1.0 - steer_smooth)    * steer
+        throttle = throttle_smooth * self._prev_control[1] + (1.0 - throttle_smooth) * throttle
+
+        # --- Mutual exclusivity (brake-priority) ---
+        # Brake wins so the RL agent can slow the vehicle even when the
+        # controller's throttle EMA is still high from normal driving.
+        if brake > 0.05:
             throttle = 0.0
+        elif throttle > 0.05:
+            brake = 0.0
+
+        self._prev_control = np.array([steer, throttle, brake])
 
         self.vehicle.apply_control(carla.VehicleControl(
             steer=steer, throttle=throttle, brake=brake
@@ -471,16 +572,58 @@ class CarlaEnv(gym.Env):
             return 0.0, 0.0, 1.0   # no route: hold brakes
 
         tf = self.vehicle.get_transform()
-        target_wp = self._waypoints[self._waypoint_idx][0]
+        vehicle_loc = tf.location
 
-        # Pure-pursuit steering: angle to waypoint normalised by max steer (0.7 rad)
-        steer_angle = self.vehicle_manager.calculate_steering_to_waypoint(tf, target_wp)
-        steer = float(np.clip(steer_angle / 0.7, -1.0, 1.0))
-
-        # Proportional speed controller
         velocity = self.vehicle.get_velocity()
         speed = math.hypot(velocity.x, velocity.y)
+
+        # Speed-adaptive lookahead distance along the route.
+        min_lookahead = self.config['simulation'].get('min_lookahead', 8.0)
+        lookahead_gain = self.config['simulation'].get('lookahead_gain', 1.5)
+        lookahead = max(min_lookahead, lookahead_gain * speed)
+
+        # Project the vehicle onto the current route segment to get its arc position,
+        # then pick the first waypoint at least `lookahead` arc-metres ahead.
+        route_wp = self._waypoints[self._waypoint_idx][0]
+        next_seg_idx = min(self._waypoint_idx + 1, len(self._waypoints) - 1)
+        wp_a = route_wp.transform.location
+        wp_b = self._waypoints[next_seg_idx][0].transform.location
+        ax, ay = wp_b.x - wp_a.x, wp_b.y - wp_a.y
+        bx, by = vehicle_loc.x - wp_a.x, vehicle_loc.y - wp_a.y
+        seg_sq = ax * ax + ay * ay
+        t = max(0.0, min(1.0, (bx * ax + by * ay) / max(seg_sq, 1e-6)))
+        proj_arc = self._route_dists[self._waypoint_idx] + t * math.sqrt(seg_sq)
+
+        target_wp = self._waypoints[-1][0]
+        for i in range(self._waypoint_idx, len(self._waypoints)):
+            if self._route_dists[i] - proj_arc >= lookahead:
+                target_wp = self._waypoints[i][0]
+                break
+
+        self._ctrl_target_loc = target_wp.transform.location
+
+        # Geometric pure-pursuit: δ = arctan(2L sin(α) / ld).
+        # The ld denominator scales down steer for distant targets.
+        wp_loc = target_wp.transform.location
+        d_to_target = math.hypot(wp_loc.x - vehicle_loc.x, wp_loc.y - vehicle_loc.y)
+        bearing_error = self.vehicle_manager.calculate_steering_to_waypoint(tf, target_wp)
+        pp_angle = math.atan2(2.0 * self._wheelbase * math.sin(bearing_error),
+                              max(d_to_target, 1.0))
+        steer = float(np.clip(pp_angle / 0.7, -1.0, 1.0))
+
+        if self.episode_length % 20 == 0:
+            Log.info(__file__,
+                f"[CTRL] wp_idx={self._waypoint_idx}/{len(self._waypoints)} "
+                f"target=({wp_loc.x:.1f},{wp_loc.y:.1f}) "
+                f"vehicle=({vehicle_loc.x:.1f},{vehicle_loc.y:.1f}) "
+                f"bearing={math.degrees(bearing_error):.1f}° "
+                f"steer={steer:.3f} speed={speed:.2f}m/s"
+            )
+
+        # Proportional speed controller.
+        # Reduce speed when risk blend is high (obstacles nearby).
         target_speed = self.config['risk']['reward']['speed_cap']
+        target_speed *= max(0.3, 1.0 - self._blend_alpha)
         error = target_speed - speed
         if error > 0:
             throttle = float(min(1.0, error / target_speed))
@@ -559,13 +702,16 @@ class CarlaEnv(gym.Env):
         risk = min(1.0, angle_diff / math.pi) # normalised [0, 1]
         return risk
 
-    def _find_closest_waypoint_ahead(self, from_idx: int = 0, search_limit: int = None, transform: 'carla.Transform' = None) -> tuple[int, float]:
+    def _find_closest_waypoint_ahead(self, from_idx: int = 0, search_limit: int = None, transform: 'carla.Transform' = None, require_road_alignment: bool = False) -> tuple[int, float]:
         """
         @brief Find the closest waypoint ahead of the vehicle within a search window.
 
         @param from_idx  Start index in self._waypoints to search from.
         @param search_limit  Max number of waypoints to scan. None means entire route.
         @param transform  Transform to use as reference. Defaults to the vehicle's current transform.
+        @param require_road_alignment  If True, also require the waypoint's own road forward
+               vector to align with the reference forward (dot > 0). Used at spawn time to
+               avoid snapping to waypoints on the opposite-direction lane.
         @return (index, distance) of the nearest ahead waypoint.
         """
         tf = transform if transform is not None else self.vehicle.get_transform()
@@ -582,6 +728,13 @@ class CarlaEnv(gym.Env):
             d = math.hypot(dx, dy)  # √(dx²+dy²)
             if d < fallback_dist:
                 fallback_dist, fallback_idx = d, i
+
+            # Skip waypoints whose road direction opposes the reference heading.
+            if require_road_alignment:
+                wp_fwd = self._waypoints[i][0].transform.get_forward_vector()
+                if wp_fwd.x * vehicle_fwd.x + wp_fwd.y * vehicle_fwd.y < 0.0:
+                    continue
+
             if d > 0 and (dx / d * vehicle_fwd.x + dy / d * vehicle_fwd.y) >= 0:
                 if d < best_dist:
                     best_dist, best_idx = d, i
@@ -622,26 +775,22 @@ class CarlaEnv(gym.Env):
 
     def _goal_reached(self) -> bool:
         """
-        @brief Determine if the ego vehicle has completed the waypoint route.
+        @brief Determine if the ego vehicle has reached the destination.
 
         @details
-        Goal is reached when the vehicle has followed the planned waypoints
-        to the final waypoint and is within goal_threshold metres of it.
-        This ensures the vehicle must follow the route rather than shortcut
-        directly to the destination.
+        Goal is reached when the vehicle is within goal_threshold metres of
+        _destination, which is anchored to the last route waypoint. The
+        waypoint index is not checked — it lags one step behind and would
+        prevent detection when the vehicle physically arrives but the progress
+        tracker has not yet caught up.
 
-        @return bool True if at the last waypoint and within goal_threshold.
+        @return bool True if within goal_threshold of the destination.
         """
 
-        if not self._waypoints:
+        if self._destination is None:
             return False
 
-        last_idx = len(self._waypoints) - 1
-        if self._waypoint_idx < last_idx:
-            return False
-
-        last_wp_loc = self._waypoints[last_idx][0].transform.location
-        dist = self.vehicle.get_location().distance(last_wp_loc)
+        dist = self.vehicle.get_location().distance(self._destination)
         return dist < self.config['simulation'].get('goal_threshold', 5.0)
 
     def _timeout(self) -> bool:
@@ -891,6 +1040,8 @@ class CarlaEnv(gym.Env):
             self.vehicle.destroy()
             self.vehicle = None
 
+        self.npc_manager.destroy_all()
+
         self.sensor_manager.destroy_sensors()
         self.collision_history = []
 
@@ -913,11 +1064,11 @@ class CarlaEnv(gym.Env):
         debug = self.world.debug
         n = self.config['risk']['waypoints_ahead']
 
-        # Draw a line from the vehicle to the current target waypoint
-        if self._waypoint_idx < len(self._waypoints):
+        # Draw a line from the vehicle to the actual lookahead target the controller steers toward
+        if self._ctrl_target_loc is not None:
             vehicle_loc = self.vehicle.get_location() + carla.Location(z=0.5)
-            target_loc = self._waypoints[self._waypoint_idx][0].transform.location + carla.Location(z=0.5)
-            debug.draw_line(vehicle_loc, target_loc, thickness=0.02, color=carla.Color(255, 255, 0), life_time=0.1)
+            target_loc = self._ctrl_target_loc + carla.Location(z=0.5)
+            debug.draw_line(vehicle_loc, target_loc, thickness=0.03, color=carla.Color(255, 255, 0), life_time=0.1)
 
         # Draw N waypoints behind the current index as grey trail
         for i in range(1, n + 1):

@@ -41,6 +41,12 @@ def main():
 
     session = TrainingSession(algo="cvar_sac")
 
+    seed = session.env.config['training'].get('seed', 42)
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
     cvar_cfg = session.env.config['cvar_sac']
     total_steps = session.env.config['training']['total_steps']
     batch_size = cvar_cfg['batch_size']
@@ -167,12 +173,11 @@ def main():
         Log.error(__file__, e)
 
     finally:
+        avg = total_reward / max(step_count, 1)
         Log.info(__file__,
             f"\n🏳️  Training stopped at step {step_count}; "
-            f"total: {total_reward.sum():.2f}\n"
-            f"\t- nav:    {total_reward[0]:.2f}\n"
-            f"\t- safety: {total_reward[1]:.2f}\n"
-            f"\t- risk:   {total_reward[2]:.2f}\n"
+            f"avg/step — max: {avg.max():.4f} med: {np.median(avg):.4f} min: {avg.min():.4f}\n"
+            f"\t[ nav: {avg[0]:.4f}, safety: {avg[1]:.4f}, risk: {avg[2]:.4f} ]\n"
         )
         session.close()
 

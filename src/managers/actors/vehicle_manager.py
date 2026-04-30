@@ -1,3 +1,4 @@
+import math
 import carla
 import numpy as np
 from dataclasses import dataclass
@@ -66,13 +67,21 @@ class VehicleManager:
         blueprint = blueprints[0]
         vehicle = self.world.try_spawn_actor(blueprint, transform)
         if vehicle:
+            if set_physics:
+                # Lower the centre of mass to reduce rollover tendency.
+                # CARLA's default CoM is at the geometric centre which sits high
+                # relative to the real vehicle; dropping it by 0.4 m gives
+                # realistic roll stiffness without changing handling drastically.
+                physics = vehicle.get_physics_control()
+                physics.center_of_mass = carla.Vector3D(0.0, 0.0, -0.4)
+                vehicle.apply_physics_control(physics)
+
             vehicle_state = VehicleState(
                 actor=vehicle,
                 wheelbase=self.get_wheelbase(vehicle),
                 desired_speed=0.0
             )
             self.vehicles.append(vehicle_state)
-            # print(f"Spawned ego vehicle: {vehicle.type_id}")
             return vehicle
 
         return None
@@ -85,15 +94,18 @@ class VehicleManager:
         @return The wheelbase in metres.
         """
         physics_control = vehicle.get_physics_control()
-        
-        # Wheels are indexed; 0: Front Left, 1: Front Right, 2: Rear Left, 3: Rear Right.
-        # Calculate the average X position for front and rear axles.
-        # CARLA wheel positions are in centimetres; divide by 100 to convert to metres.
-        front_wheels_x = (physics_control.wheels[0].position.x + physics_control.wheels[1].position.x) / 200.0
-        rear_wheels_x = (physics_control.wheels[2].position.x + physics_control.wheels[3].position.x) / 200.0
-        
-        # The longitudinal distance between axles is the wheelbase.
-        return abs(front_wheels_x - rear_wheels_x)
+
+        # Wheels: 0=Front Left, 1=Front Right, 2=Rear Left, 3=Rear Right.
+        # Positions are world-space coordinates in centimetres.
+        # Use the full XY Euclidean distance between axle midpoints so the result
+        # is correct regardless of which direction the vehicle is facing at spawn.
+        front_x = (physics_control.wheels[0].position.x + physics_control.wheels[1].position.x) / 2.0
+        front_y = (physics_control.wheels[0].position.y + physics_control.wheels[1].position.y) / 2.0
+        rear_x  = (physics_control.wheels[2].position.x + physics_control.wheels[3].position.x) / 2.0
+        rear_y  = (physics_control.wheels[2].position.y + physics_control.wheels[3].position.y) / 2.0
+
+        wheelbase_cm = math.sqrt((front_x - rear_x) ** 2 + (front_y - rear_y) ** 2)
+        return wheelbase_cm / 100.0
 
     def calculate_steering_to_waypoint(self, current_transform: carla.Transform, target_waypoint: carla.Waypoint) -> float:
         """

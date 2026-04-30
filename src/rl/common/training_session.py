@@ -144,7 +144,7 @@ class TrainingSession:
         log_text = (
             f"{status}; "
             f"waypoints: {info['wp_idx']}/{max(info['wp_total'], 1)}; "
-            f"total: {episode_reward.sum():.2f} "
+            f"max: {episode_reward.max():.2f} med: {np.median(episode_reward):.2f} min: {episode_reward.min():.2f} "
             f"[ nav: {episode_reward[0]:.2f}, safety: {episode_reward[1]:.2f}, risk: {episode_reward[2]:.2f} ]"
         )
         Log.info(__file__, log_text)
