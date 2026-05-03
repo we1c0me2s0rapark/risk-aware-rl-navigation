@@ -155,31 +155,32 @@ class CVaRSACTrainer(SACTrainer):
 
         return loss
 
-    def update(self, buffer, batch_size: int = 256) -> dict:
+    def update(self, buffer, batch_size: int = 256, update_actor: bool = True) -> dict:
         """
         @brief Perform one CVaR-SAC update step.
 
         @details
-        Update order (same as SACTrainer except steps 1 and 2):
-            1. Sample batch from replay buffer
-            2. Compute distributional Bellman target (quantile-wise min)
-            3. Compute quantile regression critic loss
-            4. Compute actor loss using CVaR_α(Z1) instead of E[Q1]
-            5. Compute alpha loss (inherited, unchanged)
-            6. Soft update target critic
+        Update order:
+            1. Distributional critic update (always)
+            2. CVaR actor update          (skipped when update_actor=False)
+            3. Alpha update               (skipped when update_actor=False)
+            4. Soft update target critic  (always)
+
+        During critic warmup (update_actor=False) only the quantile network
+        is trained. This lets the distributional critic learn a meaningful
+        return distribution from BC demos before CVaR gradients drive the actor,
+        preventing the random critic from immediately corrupting BC initialisation.
 
         @param buffer ReplayBuffer Replay buffer to sample from.
         @param batch_size int Minibatch size.
+        @param update_actor bool Whether to update the actor and alpha this step.
         @return dict Loss metrics: critic_loss, actor_loss, alpha_loss, alpha, cvar_mean.
         """
 
         obs, actions, rewards, next_obs, dones = buffer.sample(batch_size)
 
-        # Reduce decomposed reward to scalar [B]
         rewards = self._scalar_reward(rewards)
 
-        # Encode each observation once. The encoder is shared but not in any
-        # optimiser, so detaching avoids backprop through frozen weights.
         with torch.no_grad():
             next_latent = self.policy._encode(next_obs)
             next_action, next_log_prob, _ = self.policy.actor.sample(next_latent)
@@ -194,7 +195,7 @@ class CVaRSACTrainer(SACTrainer):
         obs_latent = self.policy._encode(obs).detach()
 
         # ================================================================
-        # 1. Distributional critic update
+        # 1. Distributional critic update (always)
         # ================================================================
         with torch.autocast('cuda', dtype=torch.float16, enabled=self._use_amp):
             z1, z2 = self.policy.critic(obs_latent, actions)
@@ -206,44 +207,46 @@ class CVaRSACTrainer(SACTrainer):
         self.critic_optimiser.zero_grad()
         self.scaler.scale(critic_loss).backward()
         self.scaler.step(self.critic_optimiser)
-
-        # ================================================================
-        # 2. CVaR actor update
-        # ================================================================
-        # Reuse obs_latent (already detached — matches evaluate() semantics)
-        with torch.autocast('cuda', dtype=torch.float16, enabled=self._use_amp):
-            action_new, log_prob_new, _ = self.policy.actor.sample(obs_latent)
-            cvar = self.policy.critic.cvar(obs_latent, action_new, alpha=self.policy.cvar_alpha)
-            actor_loss = (self.alpha * log_prob_new - cvar).mean()
-
-        self.actor_optimiser.zero_grad()
-        self.scaler.scale(actor_loss).backward()
-        self.scaler.step(self.actor_optimiser)
-
         self.scaler.update()
 
-        # ================================================================
-        # 3. Alpha update — kept in fp32 for numerical stability
-        # ================================================================
-        alpha_loss = -(
-            self.log_alpha * (log_prob_new.detach().float() + self.target_entropy)
-        ).mean()
+        actor_loss = cvar = log_prob_new = None
 
-        self.alpha_optimiser.zero_grad()
-        alpha_loss.backward()
-        self.alpha_optimiser.step()
+        if update_actor:
+            # ================================================================
+            # 2. CVaR actor update
+            # ================================================================
+            with torch.autocast('cuda', dtype=torch.float16, enabled=self._use_amp):
+                action_new, log_prob_new, _ = self.policy.actor.sample(obs_latent)
+                cvar = self.policy.critic.cvar(obs_latent, action_new, alpha=self.policy.cvar_alpha)
+                actor_loss = (self.alpha * log_prob_new - cvar).mean()
 
-        self.alpha = self.log_alpha.exp().item()
+            self.actor_optimiser.zero_grad()
+            self.scaler.scale(actor_loss).backward()
+            self.scaler.step(self.actor_optimiser)
+            self.scaler.update()
+
+            # ================================================================
+            # 3. Alpha update — kept in fp32 for numerical stability
+            # ================================================================
+            alpha_loss = -(
+                self.log_alpha * (log_prob_new.detach().float() + self.target_entropy)
+            ).mean()
+
+            self.alpha_optimiser.zero_grad()
+            alpha_loss.backward()
+            self.alpha_optimiser.step()
+
+            self.alpha = self.log_alpha.exp().item()
 
         # ================================================================
-        # 4. Soft update target critic
+        # 4. Soft update target critic (always)
         # ================================================================
         self.policy.soft_update_target(self.tau)
 
         return {
             'critic_loss': critic_loss.item(),
-            'actor_loss':  actor_loss.item(),
-            'alpha_loss':  alpha_loss.item(),
+            'actor_loss':  actor_loss.mean().item() if actor_loss is not None else 0.0,
+            'alpha_loss':  alpha_loss.item() if update_actor else 0.0,
             'alpha':       self.alpha,
-            'cvar_mean':   cvar.mean().item(), # track mean CVaR for TensorBoard
+            'cvar_mean':   cvar.mean().item() if cvar is not None else 0.0,
         }

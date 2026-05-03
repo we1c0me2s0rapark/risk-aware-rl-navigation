@@ -29,18 +29,15 @@ simulation:
   min_route_distance: 50.0      # @brief Minimum straight-line distance (metres) between start and goal spawn points.
   min_route_waypoints: 50       # @brief Minimum waypoints a valid route must have (2m spacing ≈ 100m of road).
   num_npc_vehicles: 30          # @brief Number of NPC vehicles spawned by Traffic Manager per episode.
-  min_npc_distance: 15.0        # @brief Minimum distance (metres) between NPC spawn points and the ego vehicle.
+  min_npc_distance: 10.0        # @brief Minimum distance (metres) between NPC spawn points and the ego vehicle.
   tm_port: 8000                 # @brief CARLA Traffic Manager port.
-  num_static_obstacles: 7       # @brief Stationary vehicles placed on the ego's route per episode.
+  num_static_obstacles: 10      # @brief Stationary vehicles placed on the ego's route per episode.
   static_obstacle_min_gap: 20   # @brief Minimum waypoints ahead of ego spawn (~40 m) before first obstacle.
-  steer_smoothing: 0.3          # @brief EMA coefficient for steering (low = responsive to turns, high = smooth but sluggish).
+  steer_smoothing: 0.6          # @brief EMA coefficient for steering (low = responsive to turns, high = smooth but sluggish).
   throttle_smoothing: 0.7       # @brief EMA coefficient for throttle/speed smoothing (high = suppresses oscillation).
   stuck_timeout: 100            # @brief Steps below 0.5 m/s (outside stopping) before episode ends as stuck (~5 s).
-  risk_stop_threshold: 0.3      # @brief Blend alpha above which a stopped vehicle is treated as waiting (not stuck) and time penalty is refunded.
-  alpha_smoothing: 0.7          # @brief EMA coefficient for blend-alpha transitions (prevents sudden RL takeover when a car appears).
-  max_blend_alpha: 0.5          # @brief Hard cap on blend alpha so the controller always retains ≥50% authority.
-  min_lookahead: 4.0            # @brief Minimum pure-pursuit lookahead distance (metres) regardless of speed.
-  lookahead_gain: 1.5           # @brief Lookahead scales as gain × speed (m/s), so faster → farther target.
+  risk_stop_ttc: 1.5            # @brief TTC threshold (seconds) below which a stopped vehicle is treated as waiting (not stuck).
+  lookahead_dist: 6.0           # @brief Distance (metres) ahead on the route used for cross-track/heading error and viz line.
 
 # ----------------------------------------------------------------------------- 
 # @section render Rendering settings
@@ -107,17 +104,16 @@ risk:
     walker: 2.5                     # @brief Weight assigned to pedestrian agents.
     cyclist: 1.8                    # @brief Weight assigned to cyclist agents.
   reward:
-    goal_progress_scale: 10.0       # @brief Multiplier for distance progress reward
-    heading_alignment_scale: 2.0    # @brief Weight for alignment with waypoint direction
-    wrong_way_penalty: 2.5          # @brief Penalty for driving against lane direction
-    speed_reward_scale: 0.1         # @brief Reward per m/s of forward speed
-    speed_cap: 7.0                  # @brief Maximum speed (m/s) contributing to reward
+    goal_progress_scale: 15.0       # @brief Multiplier for distance progress reward (raised: RL must drive progress without controller assist).
+    heading_alignment_scale: 5.0    # @brief Weight for alignment with waypoint direction.
+    speed_reward_scale: 0.15        # @brief Reward per m/s of forward speed (raised: encourage RL to accelerate without controller push).
+    speed_cap: 7.0                  # @brief Maximum speed (m/s) contributing to reward; excess is penalised by overspeed_scale per m/s.
+    overspeed_scale: 2.0            # @brief Penalty per m/s above speed_cap (e.g. 9 m/s → −4.0/step).
     collision_penalty: 20.0         # @brief Penalty applied on collision
     time_penalty: 0.5               # @brief Per-step penalty to discourage idling
-    ttc_threshold: 3.0              # @brief TTC threshold (seconds) for risk-aware penalty
-    ttc_penalty_scale: 1.0          # @brief Scaling factor for risk-based TTC penalty
-    off_route_penalty_scale: 3.5    # @brief Scaling factor for the quadratic off-route penalty applied to nav reward.
-    cross_track_scale: 2.5          # @brief Linear penalty per unit normalised lateral distance from the route centerline.
+    ttc_penalty_scale: 1.0          # @brief Scaling factor for continuous risk penalty (applied to smooth exp-decay risk_score).
+    off_route_penalty_scale: 8.0    # @brief Scaling factor for the quadratic off-route penalty applied to nav reward.
+    cross_track_scale: 4.0          # @brief Linear penalty per unit normalised lateral distance.
 
 # -----------------------------------------------------------------------------
 # @section ppo Proximal Policy Optimisation (PPO) settings
@@ -140,7 +136,9 @@ ppo:
 sac:
   batch_size: 256               # @brief Minibatch size for each SAC update.
   buffer_capacity: 500_000      # @brief Maximum number of transitions in the replay buffer.
-  learning_starts: 1_000        # @brief Warm-up steps with random actions before training begins.
+  learning_starts: 5_000        # @brief Warm-up steps running the controller as expert before RL training begins.
+  bc_steps: 2000                # @brief Gradient steps of behaviour-cloning pre-training on controller demos after warm-up.
+  bc_lr: 0.0001                   # @brief Learning rate for the BC pre-training phase (lower than SAC lr to avoid overshooting).
   save_every: 10_000            # @brief Steps between checkpoint saves.
   log_every: 1_000              # @brief Steps between periodic log outputs.
   update_every: 8               # @brief Steps between gradient updates after learning_starts.
@@ -152,9 +150,12 @@ sac:
 cvar_sac:
   batch_size: 256               # @brief Minibatch size for each CVaR-SAC update.
   buffer_capacity: 500_000      # @brief Maximum number of transitions in the replay buffer.
-  learning_starts: 1_000        # @brief Warm-up steps with random actions before training begins.
+  learning_starts: 5_000        # @brief Warm-up steps running the controller as expert before RL training begins.
+  bc_steps: 2000                # @brief Gradient steps of behaviour-cloning pre-training on controller demos after warm-up.
+  bc_lr: 0.0001                   # @brief Learning rate for the BC pre-training phase (lower than SAC lr to avoid overshooting).
   save_every: 10_000            # @brief Steps between checkpoint saves.
   log_every: 1_000              # @brief Steps between periodic log outputs.
   n_quantiles: 32               # @brief Number of quantiles for the distributional critic.
   cvar_alpha: 0.1               # @brief CVaR confidence level (worst fraction of outcomes to optimise for).
   update_every: 8               # @brief Steps between gradient updates after learning_starts.
+  critic_warmup_steps: 2000     # @brief Critic-only gradient steps after BC before actor updates begin.

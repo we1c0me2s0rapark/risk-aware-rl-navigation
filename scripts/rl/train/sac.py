@@ -2,6 +2,7 @@ import os
 import sys
 import time
 import torch
+import torch.nn.functional as F
 import numpy as np
 from collections import defaultdict
 
@@ -21,6 +22,39 @@ try:
 except ImportError as e:
     print(f"[ERROR at {os.path.basename(__file__)}] {e}")
 
+def _encode_controller_action(steer: float, throttle: float, brake: float) -> np.ndarray:
+    """Encode controller outputs to 2-D combined action space [steer, combined_tb].
+
+    combined_tb = throttle - brake ∈ [-1, 1]: positive = throttle, negative = brake.
+    Normal driving (throttle≈0.3, brake=0) maps to combined≈0.3 — well inside tanh
+    interior, avoiding the saturation region that SAC entropy fights against.
+    """
+    s        = float(np.clip(steer,            -1.0, 1.0))
+    combined = float(np.clip(throttle - brake, -1.0, 1.0))
+    return np.array([s, combined], dtype=np.float32)
+
+def _run_bc_pretraining(agent, bc_steps: int, bc_lr: float, batch_size: int, log_file: str):
+    """Pretrain actor + encoder via behaviour cloning on buffered controller demos."""
+    if len(agent.buffer) < batch_size:
+        Log.info(log_file, f"Buffer too small for BC ({len(agent.buffer)} < {batch_size}). Skipping.")
+        return
+    bc_params = list(agent.policy.encoder.parameters()) + list(agent.policy.actor.parameters())
+    bc_opt = torch.optim.Adam(bc_params, lr=float(bc_lr))
+
+    Log.info(log_file, f"Starting BC pre-training for {bc_steps} steps...")
+    for i in range(bc_steps):
+        obs_b, act_b, _, _, _ = agent.buffer.sample(batch_size)
+        latent_b = agent.policy._encode(obs_b)
+        mean_b, _ = agent.policy.actor(latent_b)   # pre-squash mean
+        loss = F.mse_loss(torch.tanh(mean_b), act_b)
+        bc_opt.zero_grad()
+        loss.backward()
+        bc_opt.step()
+        if (i + 1) % 500 == 0:
+            Log.info(log_file, f"BC [{i+1}/{bc_steps}] loss={loss.item():.4f}")
+
+    Log.info(log_file, "BC pre-training complete — switching to SAC updates.")
+
 def main():
     """
     @brief SAC training loop for CARLA environment.
@@ -29,9 +63,13 @@ def main():
     SAC is off-policy: transitions are stored in a replay buffer and
     sampled randomly for updates. Updates happen every update_every steps
     once the buffer has enough transitions (>= learning_starts).
+
+    Warmup phase runs the pure-pursuit waypoint controller as an expert to
+    populate the replay buffer with quality demonstrations. A short BC
+    pre-training phase then initialises the actor before SAC updates begin.
     """
 
-    action_dim = 3
+    action_dim = 2
     step_count = 0
     total_reward = np.zeros(3)
 
@@ -48,6 +86,8 @@ def main():
     batch_size = sac_cfg['batch_size']
     buffer_capacity = sac_cfg['buffer_capacity']
     learning_starts = sac_cfg['learning_starts']
+    bc_steps = sac_cfg.get('bc_steps', 2000)
+    bc_lr = sac_cfg.get('bc_lr', 1e-4)
     save_every = sac_cfg['save_every']
     log_every = sac_cfg['log_every']
     update_every = sac_cfg.get('update_every', 1)
@@ -66,11 +106,12 @@ def main():
     obs = session.env.reset()
 
     timings = defaultdict(float)
+    bc_done = step_count >= learning_starts  # skip BC when resuming past warmup
 
     try:
         session.setup()
         Log.info(__file__, f"Starting SAC training on {session.device}")
-        Log.info(__file__, f"Warming up for {learning_starts} steps...")
+        Log.info(__file__, f"Collecting {learning_starts} controller demos, then BC for {bc_steps} steps...")
 
         while step_count < total_steps:
             if is_q_pressed():
@@ -84,9 +125,14 @@ def main():
 
             t0 = time.perf_counter()
             if step_count < learning_starts:
-                action_np = session.env.action_space.sample()
+                # Run waypoint controller as expert; encode to tanh-space for buffer
+                ctrl = session.env._compute_controller_action()
+                action_np = _encode_controller_action(*ctrl)
                 action = torch.tensor(action_np, dtype=torch.float32, device=session.device)
             else:
+                if not bc_done:
+                    _run_bc_pretraining(agent, bc_steps, bc_lr, batch_size, __file__)
+                    bc_done = True
                 action, _ = agent.act(obs_tensor)
                 action_np = action.detach().cpu().numpy().squeeze(0)
             timings['act'] += time.perf_counter() - t0
@@ -119,7 +165,7 @@ def main():
             obs = next_obs
             step_count += 1
 
-            if step_count >= learning_starts and step_count % update_every == 0:
+            if step_count >= learning_starts and bc_done and step_count % update_every == 0:
                 t0 = time.perf_counter()
                 losses = agent.update()
                 if torch.cuda.is_available():
@@ -135,7 +181,7 @@ def main():
                 episode_steps = 0
                 obs = session.env.reset()
 
-            if step_count % log_every == 0 and step_count >= learning_starts:
+            if step_count % log_every == 0 and step_count >= learning_starts and bc_done:
                 session.logger.log_buffer_size(step_count, len(agent.buffer))
 
                 total_t = sum(timings.values()) or 1e-9

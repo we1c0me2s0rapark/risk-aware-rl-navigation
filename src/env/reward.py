@@ -38,26 +38,22 @@ def navigation_reward(reward_config: dict, ego: dict, goal_progress: float, wp_d
     r += alignment * reward_config['heading_alignment_scale']
     r += min(speed, reward_config['speed_cap']) * max(alignment, 0.0) * reward_config['speed_reward_scale']
     r -= reward_config['time_penalty']
+    if speed > reward_config['speed_cap']:
+        r -= reward_config.get('overspeed_scale', 2.0) * (speed - reward_config['speed_cap'])
     return r
 
 
-def safety_reward(reward_config: dict, collision: bool, wrong_way_risk: float) -> float:
+def safety_reward(reward_config: dict, collision: bool) -> float:
     """
     @brief Compute the safety reward component.
 
-    @details
-    Penalises collisions and wrong-way driving. Applied continuously
-    each step to provide a persistent corrective signal.
-
     @param reward_config dict Reward scaling constants.
     @param collision bool True if a collision was detected this step.
-    @param wrong_way_risk float Wrong-way risk score in [0, 1].
     @return float Safety reward (non-positive).
     """
     r = 0.0
     if collision:
         r -= reward_config['collision_penalty']
-    r -= wrong_way_risk * reward_config['wrong_way_penalty']
     return r
 
 
@@ -77,10 +73,8 @@ def risk_reward(reward_config: dict, risk_features: np.ndarray, top_k: int) -> f
     r = 0.0
     max_agents = risk_features.size // _FEAT_DIM
     for i in range(min(top_k, max_agents)):
-        ttc = risk_features[i * _FEAT_DIM + _TTC_IDX]
         risk_score = risk_features[i * _FEAT_DIM + _RISK_IDX]
-        if ttc < reward_config['ttc_threshold']:
-            r -= reward_config['ttc_penalty_scale'] * float(risk_score)
+        r -= reward_config['ttc_penalty_scale'] * float(risk_score)
     return r
 
 
@@ -93,7 +87,6 @@ def decomposed_reward(
     top_k: int,
     wp_dx: float = 0.0,
     wp_dy: float = 0.0,
-    wrong_way_risk: float = 0.0,
 ) -> np.ndarray:
     """
     @brief Compute all three reward components independently.
@@ -105,7 +98,7 @@ def decomposed_reward(
 
     Components:
         [0] navigation : progress, alignment, speed
-        [1] safety     : collision, wrong-way
+        [1] safety     : collision
         [2] risk       : TTC-based proximity penalty
 
     @param reward_config dict Reward scaling constants.
@@ -116,11 +109,10 @@ def decomposed_reward(
     @param top_k int Number of agent slots in the risk vector.
     @param wp_dx float Normalised x-component of waypoint direction.
     @param wp_dy float Normalised y-component of waypoint direction.
-    @param wrong_way_risk float Wrong-way risk score in [0, 1].
     @return np.ndarray of shape (3,) - [r_nav, r_safe, r_risk].
     """
     r_nav  = navigation_reward(reward_config, ego, goal_progress, wp_dx, wp_dy)
-    r_safe = safety_reward(reward_config, collision, wrong_way_risk)
+    r_safe = safety_reward(reward_config, collision)
     r_risk = risk_reward(reward_config, risk_features, top_k)
     return np.array([r_nav, r_safe, r_risk], dtype=np.float32)
 
@@ -133,14 +125,13 @@ def baseline_reward(
     top_k: int = 5,
     wp_dx: float = 0.0,
     wp_dy: float = 0.0,
-    wrong_way_risk: float = 0.0,
 ) -> float:
     """
     @brief Compute a baseline reward ignoring risk features.
 
     @details
     Useful for standard PPO training when risk-awareness is not considered.
-    
+
     @param reward_config dict Reward scaling constants.
     @param ego dict Ego vehicle state.
     @param collision bool True if a collision was detected.
@@ -148,11 +139,10 @@ def baseline_reward(
     @param top_k int Number of agent slots in the risk vector.
     @param wp_dx float Normalised x-component of waypoint direction.
     @param wp_dy float Normalised y-component of waypoint direction.
-    @param wrong_way_risk float Wrong-way risk score in [0, 1].
     @return float Scalar reward.
     """
     return decomposed_reward(
         reward_config, ego, collision, goal_progress,
-        np.zeros(top_k * _FEAT_DIM), # no risk features for baseline
-        top_k, wp_dx, wp_dy, wrong_way_risk
+        np.zeros(top_k * _FEAT_DIM),
+        top_k, wp_dx, wp_dy,
     )

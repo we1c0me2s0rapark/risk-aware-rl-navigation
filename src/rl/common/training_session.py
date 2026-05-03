@@ -71,7 +71,7 @@ class TrainingSession:
         self.obs_config = dict(
             camera_shape=(cam['channels'], cam_res['y'], cam_res['x']),
             lidar_shape=(lidar['channels'], lidar_res['y'], lidar_res['x']),
-            ego_state_dim=6 + self.env.config['risk']['waypoints_ahead'] * 3,
+            ego_state_dim=6 + self.env.config['risk']['waypoints_ahead'] * 3 + 2 + 6,
             latent_dim=256,
             hidden_dim=128,
             n_reward_components=3,

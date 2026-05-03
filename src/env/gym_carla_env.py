@@ -154,11 +154,9 @@ class CarlaEnv(gym.Env):
         self._route_dists = []
         self._wheelbase = 2.5  # updated after spawn via get_wheelbase()
         self._route_dists = []  # cumulative arc distances, rebuilt each episode
-        self._ctrl_target_loc = None  # lookahead waypoint location used by controller, for viz
         self._risk_vec = None
         self._ego = None
         self._agents = None
-        self._blend_alpha = 0.0
         self._stopping = False
         self._prev_control = np.zeros(3)  # [steer, throttle, brake]
         self._stuck_steps = 0
@@ -199,7 +197,7 @@ class CarlaEnv(gym.Env):
         @return dict Initial observation containing:
             - 'camera': flattened RGB camera data [H*W*3]
             - 'lidar': flattened xyz LiDAR data [points*3]
-            - 'ego_state': ego vehicle state [16]
+            - 'ego_state': ego vehicle state [6 + waypoints_ahead*3 + 8]
             - 'risk_features': risk feature vector [top_k*11 + 6]
         """
 
@@ -279,11 +277,9 @@ class CarlaEnv(gym.Env):
         self.episode_length = 0
         self.collision_history = []
 
-        self._ctrl_target_loc = None
         self._risk_vec = None
         self._ego = None
         self._agents = None
-        self._blend_alpha = 0.0
         self._stopping = False
         self._prev_control = np.zeros(3)
         self._stuck_steps = 0
@@ -347,7 +343,6 @@ class CarlaEnv(gym.Env):
             # Brake to a halt — override RL and controller
             self.vehicle.apply_control(carla.VehicleControl(throttle=0.0, brake=1.0, steer=0.0))
             steer, throttle, brake = 0.0, 0.0, 1.0
-            self._blend_alpha = 0.0
         else:
             steer, throttle, brake = self._apply_control(action)
 
@@ -404,7 +399,6 @@ class CarlaEnv(gym.Env):
             self.risk_module.top_k,
             wp_dx=wp_dx,
             wp_dy=wp_dy,
-            wrong_way_risk=wrong_way_risk,
         )
 
         # Quadratic off-route penalty: grows as (dist/boundary)^2 * scale,
@@ -429,10 +423,20 @@ class CarlaEnv(gym.Env):
         speed = math.hypot(velocity.x, velocity.y)
         fully_stopped = self._stopping and speed < 0.5
 
-        # A vehicle stopped under high risk (RL is meaningfully in control) is
-        # waiting deliberately for a gap — not stuck. Suspend the stuck counter
-        # and refund the time penalty so the RL can learn that waiting is valid.
-        risk_stop = self._blend_alpha >= self.config['simulation'].get('risk_stop_threshold', 0.3) and speed < 0.5
+        # Extract minimum TTC for risk-stop detection and info logging.
+        ttc_min = float('inf')
+        if self._risk_vec is not None:
+            ttc_min = min(
+                (self._risk_vec[i * AGENT_FEAT_DIM + 4]
+                 for i in range(self.risk_module.top_k)
+                 if self._risk_vec[i * AGENT_FEAT_DIM] > 0),
+                default=float('inf')
+            )
+
+        # A vehicle stopped when a collision is genuinely imminent is waiting for
+        # a gap — not stuck. Suspend the stuck counter and refund the time penalty
+        # so the RL can learn that waiting is valid.
+        risk_stop = ttc_min < self.config['simulation'].get('risk_stop_ttc', 1.5) and speed < 0.5
         if not self._stopping and not risk_stop and speed < 0.5:
             self._stuck_steps += 1
         else:
@@ -455,11 +459,7 @@ class CarlaEnv(gym.Env):
             'goal_reached': fully_stopped,
             'stuck': stuck,
             'off_route': self._off_route(),
-            'ttc_min': float(min(
-                (self._risk_vec[i * AGENT_FEAT_DIM + 4] for i in range(self.risk_module.top_k)
-                 if self._risk_vec[i * AGENT_FEAT_DIM] > 0),
-                default=float('inf')
-            )) if self._risk_vec is not None else float('inf'),
+            'ttc_min': float(ttc_min),
             'goal_dist': self._prev_dist_to_goal, # route completion proxy
             'baseline_reward': float(baseline_rewards.sum()),
             'reward_navigation': rewards[0],
@@ -467,7 +467,6 @@ class CarlaEnv(gym.Env):
             'reward_risk': rewards[2],
             'wp_idx': self._waypoint_idx,
             'wp_total': len(self._waypoints), # route completion = wp_idx / wp_total
-            'blend_alpha': self._blend_alpha,  # 0=controller, 1=RL agent
         }
 
         speed = np.sqrt(self._ego['vx']**2 + self._ego['vy']**2)
@@ -484,68 +483,44 @@ class CarlaEnv(gym.Env):
         
     def _apply_control(self, action) -> tuple[float, float, float]:
         """
-        @brief Blend the RL action with the waypoint-follower baseline and apply it.
+        @brief Decode the RL action and apply it directly to the vehicle.
 
-        @details
-        Decodes the raw RL action from tanh-space to physical control space,
-        then blends it with the pure-pursuit controller output using a
-        risk-driven factor α:
-
-            final = (1 - α) * controller + α * rl_action
-
-        α = 0  → full waypoint follower (no risk)
-        α = 1  → full RL agent (high risk / short TTC)
-
-        @param action torch.Tensor | numpy.ndarray Raw RL action [steer, throttle, brake]
+        @param action torch.Tensor | numpy.ndarray
+            2-D action [steer, combined_tb]: combined_tb > 0 → throttle, < 0 → brake.
+            3-D action [steer, throttle, brake] decoded from tanh space (PPO legacy).
         @return tuple[float, float, float] Applied (steer, throttle, brake)
         """
 
-        # --- Decode RL action from tanh-space to physical space ---
         if isinstance(action, torch.Tensor):
             action = action.detach().cpu().numpy()
         if action.ndim > 1:
             action = action[0]
-        action = np.tanh(action)
-        rl_steer    = float(action[0])
-        rl_throttle = float((action[1] + 1) / 2)
-        rl_brake    = float((action[2] + 1) / 2)
 
-        # --- Waypoint-follower baseline ---
-        ctrl_steer, ctrl_throttle, ctrl_brake = self._compute_controller_action()
-
-        # --- Risk-driven blend ---
-        # EMA-smooth alpha so the blend regime shifts gradually rather than
-        # snapping — prevents a sudden nearby car from instantly handing full
-        # control to the (potentially erratic) RL policy.
-        alpha_raw = self._compute_blend_alpha()
-        alpha_smooth = self.config['simulation'].get('alpha_smoothing', 0.7)
-        alpha = alpha_smooth * self._blend_alpha + (1.0 - alpha_smooth) * alpha_raw
-        # Cap alpha so the controller always retains a stabilising contribution.
-        alpha = min(alpha, self.config['simulation'].get('max_blend_alpha', 0.5))
-        self._blend_alpha = alpha
-
-        steer    = (1.0 - alpha) * ctrl_steer    + alpha * rl_steer
-        throttle = (1.0 - alpha) * ctrl_throttle + alpha * rl_throttle
-        brake    = (1.0 - alpha) * ctrl_brake    + alpha * rl_brake
-
-        # --- EMA smoothing on steer and throttle to prevent sudden jumps.
-        # Steer uses a lower coefficient so the controller can respond quickly
-        # to turns; throttle uses a higher coefficient to suppress speed oscillation.
-        # Brake is not smoothed so emergency stops respond immediately.
         steer_smooth    = self.config['simulation'].get('steer_smoothing', 0.3)
         throttle_smooth = self.config['simulation'].get('throttle_smoothing', 0.7)
-        steer    = steer_smooth    * self._prev_control[0] + (1.0 - steer_smooth)    * steer
-        throttle = throttle_smooth * self._prev_control[1] + (1.0 - throttle_smooth) * throttle
 
-        # --- Mutual exclusivity (brake-priority) ---
-        # Brake wins so the RL agent can slow the vehicle even when the
-        # controller's throttle EMA is still high from normal driving.
-        if brake > 0.05:
-            throttle = 0.0
-        elif throttle > 0.05:
-            brake = 0.0
+        steer = float(np.clip(action[0], -1.0, 1.0))
+        steer = steer_smooth * self._prev_control[0] + (1.0 - steer_smooth) * steer
 
-        self._prev_control = np.array([steer, throttle, brake])
+        if len(action) == 2:
+            # 2-D combined throttle-brake: positive = throttle, negative = brake.
+            # "No brake, moderate throttle" maps to ~0.3 — well inside tanh interior,
+            # so SAC entropy does not conflict with the dominant driving state.
+            combined = float(action[1])
+            combined = throttle_smooth * self._prev_control[1] + (1.0 - throttle_smooth) * combined
+            throttle = float(np.clip( combined, 0.0, 1.0)) if combined > 0.0 else 0.0
+            brake    = float(np.clip(-combined, 0.0, 1.0)) if combined < 0.0 else 0.0
+            self._prev_control = np.array([steer, combined, 0.0])
+        else:
+            # 3-D legacy path (PPO): [steer, throttle, brake] in tanh space.
+            throttle = float(np.clip((action[1] + 1) / 2, 0.0, 1.0))
+            brake    = float(np.clip((action[2] + 1) / 2, 0.0, 1.0))
+            throttle = throttle_smooth * self._prev_control[1] + (1.0 - throttle_smooth) * throttle
+            if brake > 0.05:
+                throttle = 0.0
+            elif throttle > 0.05:
+                brake = 0.0
+            self._prev_control = np.array([steer, throttle, brake])
 
         self.vehicle.apply_control(carla.VehicleControl(
             steer=steer, throttle=throttle, brake=brake
@@ -600,8 +575,6 @@ class CarlaEnv(gym.Env):
                 target_wp = self._waypoints[i][0]
                 break
 
-        self._ctrl_target_loc = target_wp.transform.location
-
         # Geometric pure-pursuit: δ = arctan(2L sin(α) / ld).
         # The ld denominator scales down steer for distant targets.
         wp_loc = target_wp.transform.location
@@ -611,19 +584,8 @@ class CarlaEnv(gym.Env):
                               max(d_to_target, 1.0))
         steer = float(np.clip(pp_angle / 0.7, -1.0, 1.0))
 
-        if self.episode_length % 20 == 0:
-            Log.info(__file__,
-                f"[CTRL] wp_idx={self._waypoint_idx}/{len(self._waypoints)} "
-                f"target=({wp_loc.x:.1f},{wp_loc.y:.1f}) "
-                f"vehicle=({vehicle_loc.x:.1f},{vehicle_loc.y:.1f}) "
-                f"bearing={math.degrees(bearing_error):.1f}° "
-                f"steer={steer:.3f} speed={speed:.2f}m/s"
-            )
-
         # Proportional speed controller.
-        # Reduce speed when risk blend is high (obstacles nearby).
         target_speed = self.config['risk']['reward']['speed_cap']
-        target_speed *= max(0.3, 1.0 - self._blend_alpha)
         error = target_speed - speed
         if error > 0:
             throttle = float(min(1.0, error / target_speed))
@@ -633,38 +595,6 @@ class CarlaEnv(gym.Env):
             brake = float(min(1.0, -error / target_speed))
 
         return steer, throttle, brake
-
-    def _compute_blend_alpha(self) -> float:
-        """
-        @brief Compute the risk-driven blending factor α ∈ [0, 1].
-
-        @details
-        α rises linearly from 0 to 1 as the minimum TTC among nearby
-        agents drops from ttc_threshold to 0:
-
-            α = max(0, 1 − ttc_min / ttc_threshold)
-
-        α = 0  → no agents nearby, waypoint follower drives
-        α = 1  → imminent collision, RL agent has full control
-
-        @return float Blend factor in [0, 1].
-        """
-
-        if self._risk_vec is None:
-            return 0.0
-
-        ttc_threshold = self.config['risk']['reward']['ttc_threshold']
-        ttc_min = min(
-            (self._risk_vec[i * AGENT_FEAT_DIM + 4]
-             for i in range(self.risk_module.top_k)
-             if self._risk_vec[i * AGENT_FEAT_DIM] > 0),
-            default=float('inf')
-        )
-
-        if ttc_min == float('inf'):
-            return 0.0
-
-        return float(max(0.0, 1.0 - ttc_min / ttc_threshold))
 
     def _check_collision(self) -> bool:
         """
@@ -828,6 +758,52 @@ class CarlaEnv(gym.Env):
             return self._waypoints[self._waypoint_idx][0].transform.location
         return self._destination
 
+    def _get_lane_context(self) -> np.ndarray:
+        """
+        @brief Query CARLA map API for adjacent lane availability and change permissions.
+
+        @return np.ndarray of shape (6,):
+            [left_valid, left_offset_norm, right_valid, right_offset_norm,
+             change_left_allowed, change_right_allowed]
+        """
+        if self.vehicle is None or self._ego is None:
+            return np.zeros(6, dtype=np.float32)
+        try:
+            carla_map = self.world.get_map()
+            wp = carla_map.get_waypoint(
+                self.vehicle.get_location(),
+                project_to_road=True,
+                lane_type=carla.LaneType.Driving,
+            )
+            if wp is None:
+                return np.zeros(6, dtype=np.float32)
+
+            ego_fwd = np.array([math.cos(self._ego['yaw']), math.sin(self._ego['yaw'])])
+            lane_width_norm = 5.0  # normalise offset by this distance in metres
+
+            def _adjacent(adj_wp):
+                if adj_wp is None or adj_wp.lane_type != carla.LaneType.Driving:
+                    return 0.0, 0.0
+                fwd = adj_wp.transform.get_forward_vector()
+                if np.dot(ego_fwd, np.array([fwd.x, fwd.y])) < 0.0:
+                    return 0.0, 0.0  # oncoming direction
+                offset = float(np.clip(adj_wp.lane_width / lane_width_norm, 0.0, 1.0))
+                return 1.0, offset
+
+            left_valid,  left_offset  = _adjacent(wp.get_left_lane())
+            right_valid, right_offset = _adjacent(wp.get_right_lane())
+
+            lc = wp.lane_change
+            change_left  = 1.0 if lc in (carla.LaneChange.Left,  carla.LaneChange.Both) else 0.0
+            change_right = 1.0 if lc in (carla.LaneChange.Right, carla.LaneChange.Both) else 0.0
+
+            return np.array(
+                [left_valid, left_offset, right_valid, right_offset, change_left, change_right],
+                dtype=np.float32,
+            )
+        except Exception:
+            return np.zeros(6, dtype=np.float32)
+
     def _get_ego_state(self) -> dict:
         """
         @brief Extract the current state of the ego vehicle.
@@ -927,7 +903,9 @@ class CarlaEnv(gym.Env):
         @return dict Observation containing:
             - 'camera': flat RGB array [H*W*3]
             - 'lidar': flat xyz array [points*3] (intensity dropped)
-            - 'ego_state': [x, y, z, vx, vy, yaw, wp_dx0, wp_dy0, wp_d0, ...] (6 + waypoints_ahead*3 values)
+            - 'ego_state': [x, y, z, vx, vy, yaw, wp_dx0, wp_dy0, wp_d0, ..., ct_norm, he_norm,
+                            left_valid, left_offset, right_valid, right_offset, change_left, change_right]
+                           (6 + waypoints_ahead*3 + 2 + 6 values)
             - 'risk_features': risk vector [top_k*11 + 6] = [61]
         """
         
@@ -962,9 +940,14 @@ class CarlaEnv(gym.Env):
 
         risk_obs = self._risk_vec.astype(np.float32)
 
-        # Next N waypoints as relative (dx, dy) from ego position
+        # Next N waypoints in the vehicle's local (ego) frame.
+        # Rotating world-frame (dx, dy) by -ego_yaw makes the representation
+        # orientation-invariant: the same turn geometry always produces the same
+        # features regardless of which cardinal direction the vehicle faces.
         N_WAYPOINTS = self.config['risk']['waypoints_ahead']
         wp_dist_norm = self.config['risk']['waypoints_ahead'] * 2.0
+        cos_yaw = math.cos(self._ego['yaw'])
+        sin_yaw = math.sin(self._ego['yaw'])
         waypoint_obs = []
         for i in range(N_WAYPOINTS):
             idx = self._waypoint_idx + i
@@ -973,14 +956,57 @@ class CarlaEnv(gym.Env):
                 dx = wp_loc.x - self._ego['x']
                 dy = wp_loc.y - self._ego['y']
                 dist = max(np.sqrt(dx**2 + dy**2), 1e-6)
-                waypoint_obs.extend([dx / dist, dy / dist, min(dist / wp_dist_norm, 1.0)])
+                # Rotate into ego frame: forward = +x_ego, left = +y_ego
+                dx_ego =  dx * cos_yaw + dy * sin_yaw
+                dy_ego = -dx * sin_yaw + dy * cos_yaw
+                waypoint_obs.extend([dx_ego / dist, dy_ego / dist, min(dist / wp_dist_norm, 1.0)])
             else:
                 waypoint_obs.extend([0.0, 0.0, 0.0])  # pad if route ends
+
+        # Cross-track error and heading error relative to the current route segment.
+        # Both are signed and normalised to [-1, 1] so the RL has direct geometric
+        # state without needing to infer it from waypoint deltas.
+        ct_norm = 0.0
+        he_norm = 0.0
+        if self._waypoint_idx < len(self._waypoints):
+            # Walk forward from the current waypoint index until we reach one
+            # that is at least lookahead_dist metres ahead of the vehicle.
+            # Using a look-ahead target (rather than the immediate next waypoint)
+            # gives a smoother, more stable cross-track / heading signal.
+            lookahead_dist = self.config['simulation'].get('lookahead_dist', 8.0)
+            la_idx = self._waypoint_idx
+            for i in range(self._waypoint_idx, len(self._waypoints)):
+                loc = self._waypoints[i][0].transform.location
+                if math.sqrt((loc.x - self._ego['x']) ** 2 + (loc.y - self._ego['y']) ** 2) >= lookahead_dist:
+                    la_idx = i
+                    break
+            else:
+                la_idx = len(self._waypoints) - 1
+
+            wp_cur_loc  = self._waypoints[la_idx][0].transform.location
+            wp_prev_loc = self._waypoints[max(0, la_idx - 1)][0].transform.location
+            seg_x = wp_cur_loc.x - wp_prev_loc.x
+            seg_y = wp_cur_loc.y - wp_prev_loc.y
+            seg_len = max(math.sqrt(seg_x ** 2 + seg_y ** 2), 1e-6)
+            seg_dx, seg_dy = seg_x / seg_len, seg_y / seg_len
+            rel_x = self._ego['x'] - wp_prev_loc.x
+            rel_y = self._ego['y'] - wp_prev_loc.y
+            # Signed cross-track: positive = left of route direction
+            cross_track = rel_x * seg_dy - rel_y * seg_dx
+            ct_norm = float(np.clip(cross_track / self.config['simulation']['off_route_distance'], -1.0, 1.0))
+            # Heading error: ego yaw minus route direction, normalised to [-1, 1]
+            heading_err = self._ego['yaw'] - math.atan2(seg_y, seg_x)
+            heading_err = (heading_err + math.pi) % (2 * math.pi) - math.pi
+            he_norm = float(heading_err / math.pi)
+
+        lane_ctx = self._get_lane_context()
 
         ego_state = np.nan_to_num(np.array([
             self._ego['x'], self._ego['y'], self._ego['z'],
             self._ego['vx'], self._ego['vy'], self._ego['yaw'],
-            *waypoint_obs # N waypoints x 3 = N*3 values
+            *waypoint_obs,  # N waypoints × 3 = N*3 values
+            ct_norm, he_norm,  # cross-track error, heading error
+            *lane_ctx,  # left/right lane validity, offset, change permission
         ], dtype=np.float32), nan=0.0, posinf=0.0, neginf=0.0)
 
         return {
@@ -1064,11 +1090,21 @@ class CarlaEnv(gym.Env):
         debug = self.world.debug
         n = self.config['risk']['waypoints_ahead']
 
-        # Draw a line from the vehicle to the actual lookahead target the controller steers toward
-        if self._ctrl_target_loc is not None:
-            vehicle_loc = self.vehicle.get_location() + carla.Location(z=0.5)
-            target_loc = self._ctrl_target_loc + carla.Location(z=0.5)
-            debug.draw_line(vehicle_loc, target_loc, thickness=0.03, color=carla.Color(255, 255, 0), life_time=0.1)
+        # Draw a line from the vehicle to the lookahead waypoint — the same point
+        # used for cross-track and heading error in the observation.
+        if self._waypoint_idx < len(self._waypoints):
+            vehicle_loc   = self.vehicle.get_location()
+            lookahead_dist = self.config['simulation'].get('lookahead_dist', 8.0)
+            la_idx = self._waypoint_idx
+            for i in range(self._waypoint_idx, len(self._waypoints)):
+                loc = self._waypoints[i][0].transform.location
+                if math.sqrt((loc.x - vehicle_loc.x) ** 2 + (loc.y - vehicle_loc.y) ** 2) >= lookahead_dist:
+                    la_idx = i
+                    break
+            else:
+                la_idx = len(self._waypoints) - 1
+            target_loc = self._waypoints[la_idx][0].transform.location + carla.Location(z=0.5)
+            debug.draw_line(vehicle_loc + carla.Location(z=0.5), target_loc, thickness=0.03, color=carla.Color(255, 255, 0), life_time=0.1)
 
         # Draw N waypoints behind the current index as grey trail
         for i in range(1, n + 1):
@@ -1084,12 +1120,6 @@ class CarlaEnv(gym.Env):
             )
 
         # Draw the exact N waypoints fed into the model observation
-        colours = []
-        for i in range(n):
-            hue = (i / max(n - 1, 1)) * 0.8  # span red → blue, avoid wrapping back to red
-            r, g, b = colorsys.hsv_to_rgb(hue, 1.0, 1.0)
-            colours.append(carla.Color(int(r * 255), int(g * 255), int(b * 255)))
-
         for i in range(n):
             idx = self._waypoint_idx + i
             if idx >= len(self._waypoints):
@@ -1097,8 +1127,8 @@ class CarlaEnv(gym.Env):
             wp, _ = self._waypoints[idx]
             debug.draw_point(
                 wp.transform.location + carla.Location(z=0.5),
-                size=0.1,
-                color=colours[i],
+                size=0.08,
+                color=carla.Color(255, 255, 0),
                 life_time=0.1,
             )
 
@@ -1110,6 +1140,83 @@ class CarlaEnv(gym.Env):
                 color=carla.Color(255, 0, 0),
                 life_time=0.1,
             )
+
+        self._draw_lane_context()
+
+    def _draw_lane_context(self):
+        """
+        @brief Draw adjacent lane availability around the vehicle.
+
+        Green points = valid same-direction lane.
+        Orange points = lane exists but is oncoming (blocked).
+        Covers ±4 m longitudinally so the indicator stays compact.
+        """
+        if self.vehicle is None or self._ego is None:
+            return
+        try:
+            carla_map = self.world.get_map()
+            wp = carla_map.get_waypoint(
+                self.vehicle.get_location(),
+                project_to_road=True,
+                lane_type=carla.LaneType.Any,
+            )
+            if wp is None:
+                return
+
+            debug = self.world.debug
+            ego_fwd = np.array([math.cos(self._ego['yaw']), math.sin(self._ego['yaw'])])
+
+            colour_valid = carla.Color(0, 220, 0)
+            colour_invalid = carla.Color(255, 0, 0)
+
+            def _draw_current_lane(cur_wp):
+                # Green if current lane runs in the same direction as the route waypoints,
+                # red if the vehicle is facing against the flow (oncoming / wrong-way).
+                same_dir = False
+                if self._waypoints and self._waypoint_idx < len(self._waypoints):
+                    route_fwd = self._waypoints[self._waypoint_idx][0].transform.get_forward_vector()
+                    cur_fwd   = cur_wp.transform.get_forward_vector()
+                    same_dir  = (route_fwd.x * cur_fwd.x + route_fwd.y * cur_fwd.y) > 0.0
+                colour = colour_valid if same_dir else colour_invalid
+
+                bb = self.vehicle.bounding_box
+                bb.location = self.vehicle.get_location()
+                bb.extent = carla.Vector3D(bb.extent.x, bb.extent.y, 0.01)
+                bb.location.z += 0.1
+
+                debug.draw_box(
+                    bb, self.vehicle.get_transform().rotation, thickness=0.01, color=colour, life_time=0.1)
+
+            route_fwd = np.array([0.0, 0.0])
+            if self._waypoints and self._waypoint_idx < len(self._waypoints):
+                rf = self._waypoints[self._waypoint_idx][0].transform.get_forward_vector()
+                route_fwd = np.array([rf.x, rf.y])
+
+            def _draw_adjacent(adj_wp):
+                if adj_wp is None or adj_wp.lane_type != carla.LaneType.Driving:
+                    return
+                fwd = adj_wp.transform.get_forward_vector()
+                same_dir = np.dot(route_fwd, np.array([fwd.x, fwd.y])) >= 0.0
+                colour = colour_valid if same_dir else colour_invalid
+                base = adj_wp.transform.location
+
+                if True: # draw a line indicating the lane direction
+                    length = 8.0
+                    begin = carla.Location(x=base.x - fwd.x * length, y=base.y - fwd.y * length, z=base.z + 0.3)
+                    end   = carla.Location(x=base.x + fwd.x * length, y=base.y + fwd.y * length, z=base.z + 0.3)
+                    debug.draw_line(begin, end, thickness=0.01, color=colour, life_time=0.1)
+                else: # draw a box representing the lane area
+                    length = 6.0
+                    centre = carla.Location(x=base.x, y=base.y, z=base.z + 0.1)
+                    extent = carla.Vector3D(x=length, y=adj_wp.lane_width * 0.5, z=0.05)
+                    box = carla.BoundingBox(centre, extent)
+                    debug.draw_box(box, adj_wp.transform.rotation, thickness=0.015, color=colour, life_time=0.1)
+
+            _draw_adjacent(wp.get_left_lane())
+            _draw_adjacent(wp.get_right_lane())
+            _draw_current_lane(wp)
+        except Exception:
+            pass
 
     def render(self):
         """

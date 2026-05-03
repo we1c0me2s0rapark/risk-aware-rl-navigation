@@ -105,14 +105,15 @@ class CVaRSACAgent:
         """
         self.buffer.store(obs, action, reward, next_obs, done)
 
-    def update(self, batch_size: int = 256) -> dict | None:
+    def update(self, batch_size: int = 256, update_actor: bool = True) -> dict | None:
         """
         @brief Perform a CVaR-SAC update if buffer has enough transitions.
 
         @param batch_size int Minibatch size for the update.
+        @param update_actor bool If False, only the critic is updated (warmup phase).
         @return dict Loss metrics or None if buffer not ready.
         """
 
         if len(self.buffer) < batch_size:
             return None
-        return self.trainer.update(self.buffer, batch_size=batch_size)
+        return self.trainer.update(self.buffer, batch_size=batch_size, update_actor=update_actor)
