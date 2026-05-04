@@ -388,6 +388,8 @@ class CarlaEnv(gym.Env):
             self._check_collision(),
             gated_progress,
             top_k=self.risk_module.top_k,
+            wrong_way_risk=wrong_way_risk,
+            normalised_dist=normalised_dist,
         )
 
         rewards = decomposed_reward(
@@ -399,17 +401,20 @@ class CarlaEnv(gym.Env):
             self.risk_module.top_k,
             wp_dx=wp_dx,
             wp_dy=wp_dy,
+            wrong_way_risk=wrong_way_risk,
+            normalised_dist=normalised_dist,
         )
 
-        # Quadratic off-route penalty: grows as (dist/boundary)^2 * scale,
-        # reaching maximum at off_route_distance where the episode also terminates.
-        off_route_penalty = (normalised_dist ** 2) * self.config['risk']['reward']['off_route_penalty_scale']
-        rewards[0] -= off_route_penalty
-
-        # Linear cross-track penalty: constant gradient regardless of deviation size,
-        # so the agent always has a signal to return toward the route centerline.
-        cross_track_penalty = normalised_dist * self.config['risk']['reward'].get('cross_track_scale', 1.0)
-        rewards[0] -= cross_track_penalty
+        # Exponential lateral penalty: replaces the separate linear cross-track and
+        # quadratic off-route penalties with a single convex curve.
+        # The gradient pulling the vehicle back grows with distance, so small
+        # deviations are cheap but large ones become rapidly more expensive.
+        #   penalty(d) = scale * (exp(k*d) - 1) / (exp(k) - 1)
+        # At d=0: 0.  At d=1: scale.  Gradient at d=1 is k× the gradient at d=0.
+        lat_scale = self.config['risk']['reward'].get('lateral_scale', 25.0)
+        lat_exp   = self.config['risk']['reward'].get('lateral_exponent', 3.0)
+        lateral_penalty = lat_scale * (math.expm1(lat_exp * normalised_dist) / math.expm1(lat_exp))
+        rewards[0] -= lateral_penalty
 
         reward = rewards
 
@@ -433,24 +438,39 @@ class CarlaEnv(gym.Env):
                 default=float('inf')
             )
 
+        at_light, light_is_green = self._get_traffic_light_obs()
+
+        # Stopped at red/yellow: legitimate wait, same treatment as risk_stop.
+        red_light_stop = at_light and not light_is_green and speed < 0.5
+        # Moving through a red/yellow light: penalise per step.
+        red_light_running = at_light and not light_is_green and speed >= 0.5
+        if red_light_running:
+            rewards[0] -= self.config['risk']['reward'].get('red_light_penalty', 10.0)
+
         # A vehicle stopped when a collision is genuinely imminent is waiting for
         # a gap — not stuck. Suspend the stuck counter and refund the time penalty
         # so the RL can learn that waiting is valid.
         risk_stop = ttc_min < self.config['simulation'].get('risk_stop_ttc', 1.5) and speed < 0.5
-        if not self._stopping and not risk_stop and speed < 0.5:
+        valid_stop = risk_stop or red_light_stop
+        if not self._stopping and not valid_stop and speed < 0.5:
             self._stuck_steps += 1
         else:
             self._stuck_steps = 0
         stuck = self._stuck_steps >= self.config['simulation'].get('stuck_timeout', 100)
 
-        if risk_stop:
+        if valid_stop:
             rewards[0] += self.config['risk']['reward']['time_penalty']
+
+        off_road = self._off_road()
+        if off_road:
+            rewards[0] -= self.config['risk']['reward'].get('off_road_penalty', 50.0)
 
         done = (
             self._check_collision() or
             fully_stopped or
             self._timeout() or
             self._off_route() or
+            off_road or
             stuck
         )
 
@@ -459,6 +479,7 @@ class CarlaEnv(gym.Env):
             'goal_reached': fully_stopped,
             'stuck': stuck,
             'off_route': self._off_route(),
+            'off_road': off_road,
             'ttc_min': float(ttc_min),
             'goal_dist': self._prev_dist_to_goal, # route completion proxy
             'baseline_reward': float(baseline_rewards.sum()),
@@ -621,15 +642,18 @@ class CarlaEnv(gym.Env):
         @return float Wrong-way risk value in [0, 1].
         """
 
+        if self._at_turning_junction():
+            return 0.0
+
         vehicle_loc = self.vehicle.get_location()
         vehicle_yaw = math.radians(self.vehicle.get_transform().rotation.yaw)
-        
+
         waypoint = self.world.get_map().get_waypoint(vehicle_loc)
         lane_vector = waypoint.transform.get_forward_vector()
         lane_yaw = math.atan2(lane_vector.y, lane_vector.x)
 
         angle_diff = abs((vehicle_yaw - lane_yaw + math.pi) % (2*math.pi) - math.pi)
-        risk = min(1.0, angle_diff / math.pi) # normalised [0, 1]
+        risk = min(1.0, angle_diff / math.pi)
         return risk
 
     def _find_closest_waypoint_ahead(self, from_idx: int = 0, search_limit: int = None, transform: 'carla.Transform' = None, require_road_alignment: bool = False) -> tuple[int, float]:
@@ -731,6 +755,90 @@ class CarlaEnv(gym.Env):
         """
 
         return self.episode_length >= self.max_episode_length
+
+    def _get_traffic_light_obs(self) -> tuple[bool, bool]:
+        """
+        @brief Query the traffic light state affecting the ego vehicle.
+
+        @return (at_light, is_green) where:
+            at_light  — True if the vehicle is currently influenced by a traffic light.
+            is_green  — True if the light is green (or no light present → safe to proceed).
+        """
+        try:
+            if self.vehicle.is_at_traffic_light():
+                tl = self.vehicle.get_traffic_light()
+                state = tl.get_state()
+                is_green = state == carla.TrafficLightState.Green
+                return True, is_green
+        except Exception:
+            pass
+        return False, True  # no light → treat as green
+
+    def _at_turning_junction(self) -> bool:
+        """
+        @brief Return True if the vehicle is at a junction where the route turns.
+
+        @details
+        Used to gate checks and rewards that are unreliable inside intersection
+        geometry (wrong-way risk, off-road detection, blend cap, box colour).
+
+        Two conditions must both hold:
+          1. CARLA reports the vehicle is on junction geometry (is_junction=True).
+          2. The planned route turns here — the heading change from the current
+             route waypoint to one ~20 m ahead exceeds 25°. This excludes
+             tunnels and straight-through sections that CARLA also marks as
+             junctions.
+
+        @return bool True if the vehicle is at a real turning intersection.
+        """
+        wp = self.world.get_map().get_waypoint(
+            self.vehicle.get_location(),
+            project_to_road=True,
+            lane_type=carla.LaneType.Any,
+        )
+        if wp is None or not wp.is_junction:
+            return False
+        if not self._waypoints or self._waypoint_idx >= len(self._waypoints):
+            return False
+        # Check a window of ≈20 m in both directions so the junction is
+        # detected consistently from entry through exit:
+        #   - approaching: forward heading change is large, backward is small
+        #   - mid-turn:    both are large
+        #   - near exit:   forward is small, backward heading change is large
+        lookahead  = 10  # waypoints ≈ 20 m at 2 m spacing
+        cur_idx    = self._waypoint_idx
+        ahead_idx  = min(cur_idx + lookahead, len(self._waypoints) - 1)
+        behind_idx = max(cur_idx - lookahead, 0)
+        cur_fwd    = self._waypoints[cur_idx][0].transform.get_forward_vector()
+        ahead_fwd  = self._waypoints[ahead_idx][0].transform.get_forward_vector()
+        behind_fwd = self._waypoints[behind_idx][0].transform.get_forward_vector()
+        dot_fwd  = cur_fwd.x * ahead_fwd.x  + cur_fwd.y * ahead_fwd.y
+        dot_back = cur_fwd.x * behind_fwd.x + cur_fwd.y * behind_fwd.y
+        return dot_fwd < 0.9 or dot_back < 0.9  # heading change > ~25° in either window
+
+    def _off_road(self) -> bool:
+        """
+        @brief Check if the vehicle has left the drivable road surface.
+
+        @details
+        Uses CARLA's map API to query the lane type at the vehicle's current
+        location without snapping to the nearest road. Returns True when no
+        Driving-type lane is found, indicating the vehicle is on a sidewalk,
+        grass, or other non-drivable surface.
+
+        Junction interiors are excluded because CARLA does not classify
+        intersection geometry as LaneType.Driving.
+
+        @return bool True if the vehicle is off the drivable surface.
+        """
+        if self._at_turning_junction():
+            return False
+        wp = self.world.get_map().get_waypoint(
+            self.vehicle.get_location(),
+            project_to_road=False,
+            lane_type=carla.LaneType.Driving,
+        )
+        return wp is None
 
     def _off_route(self) -> bool:
         """
@@ -1000,6 +1108,7 @@ class CarlaEnv(gym.Env):
             he_norm = float(heading_err / math.pi)
 
         lane_ctx = self._get_lane_context()
+        at_light, light_is_green = self._get_traffic_light_obs()
 
         ego_state = np.nan_to_num(np.array([
             self._ego['x'], self._ego['y'], self._ego['z'],
@@ -1007,6 +1116,8 @@ class CarlaEnv(gym.Env):
             *waypoint_obs,  # N waypoints × 3 = N*3 values
             ct_norm, he_norm,  # cross-track error, heading error
             *lane_ctx,  # left/right lane validity, offset, change permission
+            float(at_light),        # 1.0 if a traffic light governs this vehicle
+            float(light_is_green),  # 1.0 if green (or no light), 0.0 if red/yellow
         ], dtype=np.float32), nan=0.0, posinf=0.0, neginf=0.0)
 
         return {
@@ -1166,18 +1277,23 @@ class CarlaEnv(gym.Env):
             debug = self.world.debug
             ego_fwd = np.array([math.cos(self._ego['yaw']), math.sin(self._ego['yaw'])])
 
-            colour_valid = carla.Color(0, 220, 0)
+            colour_valid   = carla.Color(0, 220, 0)
             colour_invalid = carla.Color(255, 0, 0)
+            colour_junction = carla.Color(139, 69, 19)
 
             def _draw_current_lane(cur_wp):
+                # Brown inside a junction: directional check is unreliable there.
                 # Green if current lane runs in the same direction as the route waypoints,
                 # red if the vehicle is facing against the flow (oncoming / wrong-way).
-                same_dir = False
-                if self._waypoints and self._waypoint_idx < len(self._waypoints):
-                    route_fwd = self._waypoints[self._waypoint_idx][0].transform.get_forward_vector()
-                    cur_fwd   = cur_wp.transform.get_forward_vector()
-                    same_dir  = (route_fwd.x * cur_fwd.x + route_fwd.y * cur_fwd.y) > 0.0
-                colour = colour_valid if same_dir else colour_invalid
+                if self._at_turning_junction():
+                    colour = colour_junction
+                else:
+                    same_dir = False
+                    if self._waypoints and self._waypoint_idx < len(self._waypoints):
+                        route_fwd = self._waypoints[self._waypoint_idx][0].transform.get_forward_vector()
+                        cur_fwd   = cur_wp.transform.get_forward_vector()
+                        same_dir  = (route_fwd.x * cur_fwd.x + route_fwd.y * cur_fwd.y) > 0.0
+                    colour = colour_valid if same_dir else colour_invalid
 
                 bb = self.vehicle.bounding_box
                 bb.location = self.vehicle.get_location()

@@ -39,11 +39,11 @@ class PPOActor(nn.Module):
             self.mean = nn.Linear(128, action_dim)
             self.log_std = nn.Parameter(torch.zeros(action_dim)) # learnable log std
 
-            # Initialise biases to favour acceleration over braking
-            # so the agent moves immediately rather than hesitating
-            nn.init.constant_(self.mean.bias, 0.0) # steer: centred
-            self.mean.bias.data[1] = 1.0 # throttle → ~0.73 after rescaling
-            self.mean.bias.data[2] = -2.0 # brake → ~0.12 after rescaling
+            # Initialise biases: steer centred, combined_tb biased toward moderate throttle.
+            # With 2-D action space [steer, combined_tb], index 2 (brake) no longer exists.
+            nn.init.constant_(self.mean.bias, 0.0)
+            if action_dim > 1:
+                self.mean.bias.data[1] = 0.3  # combined_tb → tanh(0.3)≈0.29 throttle on first step
         else:
             # Discrete action output: logits for categorical distribution
             self.logits = nn.Linear(128, action_dim)

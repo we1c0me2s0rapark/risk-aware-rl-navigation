@@ -13,7 +13,7 @@ _FEAT_DIM = 11
 _TTC_IDX  = 4       # @brief Index of time-to-collision (TTC) within one agent feature block.
 _RISK_IDX = 5       # @brief Index of risk score within one agent feature block.
 
-def navigation_reward(reward_config: dict, ego: dict, goal_progress: float, wp_dx: float = 0.0, wp_dy: float = 0.0) -> float:
+def navigation_reward(reward_config: dict, ego: dict, goal_progress: float, wp_dx: float = 0.0, wp_dy: float = 0.0, wrong_way_risk: float = 0.0, normalised_dist: float = 0.0) -> float:
     """
     @brief Compute the navigation reward component.
 
@@ -33,13 +33,15 @@ def navigation_reward(reward_config: dict, ego: dict, goal_progress: float, wp_d
     wp_vec = np.array([wp_dx, wp_dy])
     alignment = float(np.dot(heading_vec, wp_vec))
     speed = np.sqrt(ego['vx']**2 + ego['vy']**2)
+    adherence = max(0.0, 1.0 - normalised_dist)
 
     r  = goal_progress * reward_config['goal_progress_scale']
-    r += alignment * reward_config['heading_alignment_scale']
-    r += min(speed, reward_config['speed_cap']) * max(alignment, 0.0) * reward_config['speed_reward_scale']
+    r += alignment * reward_config['heading_alignment_scale'] * adherence
+    r += min(speed, reward_config['speed_cap']) * max(alignment, 0.0) * reward_config['speed_reward_scale'] * adherence
     r -= reward_config['time_penalty']
     if speed > reward_config['speed_cap']:
         r -= reward_config.get('overspeed_scale', 2.0) * (speed - reward_config['speed_cap'])
+    r -= reward_config.get('wrong_way_scale', 0.0) * wrong_way_risk
     return r
 
 
@@ -87,6 +89,8 @@ def decomposed_reward(
     top_k: int,
     wp_dx: float = 0.0,
     wp_dy: float = 0.0,
+    wrong_way_risk: float = 0.0,
+    normalised_dist: float = 0.0,
 ) -> np.ndarray:
     """
     @brief Compute all three reward components independently.
@@ -111,7 +115,7 @@ def decomposed_reward(
     @param wp_dy float Normalised y-component of waypoint direction.
     @return np.ndarray of shape (3,) - [r_nav, r_safe, r_risk].
     """
-    r_nav  = navigation_reward(reward_config, ego, goal_progress, wp_dx, wp_dy)
+    r_nav  = navigation_reward(reward_config, ego, goal_progress, wp_dx, wp_dy, wrong_way_risk, normalised_dist)
     r_safe = safety_reward(reward_config, collision)
     r_risk = risk_reward(reward_config, risk_features, top_k)
     return np.array([r_nav, r_safe, r_risk], dtype=np.float32)
@@ -125,6 +129,8 @@ def baseline_reward(
     top_k: int = 5,
     wp_dx: float = 0.0,
     wp_dy: float = 0.0,
+    wrong_way_risk: float = 0.0,
+    normalised_dist: float = 0.0,
 ) -> float:
     """
     @brief Compute a baseline reward ignoring risk features.
@@ -144,5 +150,5 @@ def baseline_reward(
     return decomposed_reward(
         reward_config, ego, collision, goal_progress,
         np.zeros(top_k * _FEAT_DIM),
-        top_k, wp_dx, wp_dy,
+        top_k, wp_dx, wp_dy, wrong_way_risk, normalised_dist,
     )

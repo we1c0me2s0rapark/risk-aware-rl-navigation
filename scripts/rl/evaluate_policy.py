@@ -81,7 +81,7 @@ def main():
         obs_config = dict(
             camera_shape=(cam_config['channels'], cam_res['y'], cam_res['x']),
             lidar_shape=(lidar_config['channels'], lidar_res['y'], lidar_res['x']),
-            ego_state_dim=6 + env.config['risk']['waypoints_ahead'] * 3 + 2,
+            ego_state_dim=6 + env.config['risk']['waypoints_ahead'] * 3 + 8,
             latent_dim=256,
             hidden_dim=128,
             n_reward_components=3,

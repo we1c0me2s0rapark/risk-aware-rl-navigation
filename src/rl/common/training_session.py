@@ -68,10 +68,18 @@ class TrainingSession:
         lidar_res = lidar['train_resolution']
         render_root = self.env.config['render']['root']
 
+        _ego_state_components = [
+            ('ego_base',       6),
+            ('waypoint_feats', self.env.config['risk']['waypoints_ahead'] * 3),
+            ('route_errors',   2),
+            ('lane_ctx',       6),
+            ('traffic_light',  2),
+        ]
+
         self.obs_config = dict(
             camera_shape=(cam['channels'], cam_res['y'], cam_res['x']),
             lidar_shape=(lidar['channels'], lidar_res['y'], lidar_res['x']),
-            ego_state_dim=6 + self.env.config['risk']['waypoints_ahead'] * 3 + 2 + 6,
+            ego_state_dim=sum(dim for _, dim in _ego_state_components),
             latent_dim=256,
             hidden_dim=128,
             n_reward_components=3,
@@ -130,12 +138,15 @@ class TrainingSession:
         goal_reached = info.get('goal_reached', False)
         collision = info.get('collision', False)
         off_route = info.get('off_route', False)
+        off_road = info.get('off_road', False)
         near_miss = info.get('ttc_min', float('inf')) < 2.0
 
         if goal_reached:
             status = f"🎯 Goal reached after {steps} steps"
         elif collision:
             status = f"💥 Collision after {steps} steps"
+        elif off_road:
+            status = f"🛑 Off-road after {steps} steps"
         elif off_route:
             status = f"🚧 Off-route after {steps} steps"
         else:

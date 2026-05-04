@@ -33,6 +33,23 @@ def _encode_controller_action(steer: float, throttle: float, brake: float) -> np
     combined = float(np.clip(throttle - brake, -1.0, 1.0))
     return np.array([s, combined], dtype=np.float32)
 
+_RISK_FEAT_DIM  = 11  # must match AGENT_FEAT_DIM in risk/module.py
+_RISK_SCORE_IDX =  5  # index of risk_score within one agent feature block
+
+def _compute_risk_blend(risk_vec: np.ndarray, top_k: int, deadzone: float, scale: float) -> float:
+    """Blend weight in [0, 1]: 0 = pure controller, 1 = pure RL.
+
+    Rises linearly from 0 once risk_score exceeds deadzone, reaching 1.0
+    at deadzone + 1/scale. Below deadzone the controller has full authority.
+    """
+    if risk_vec is None or len(risk_vec) < top_k * _RISK_FEAT_DIM:
+        return 0.0
+    max_risk = max(
+        float(risk_vec[i * _RISK_FEAT_DIM + _RISK_SCORE_IDX])
+        for i in range(top_k)
+    )
+    return float(np.clip((max_risk - deadzone) * scale, 0.0, 1.0))
+
 def _run_bc_pretraining(agent, bc_steps: int, bc_lr: float, batch_size: int, log_file: str):
     """Pretrain actor + encoder via behaviour cloning on buffered controller demos."""
     if len(agent.buffer) < batch_size:
@@ -116,7 +133,8 @@ def main():
     obs = session.env.reset()
 
     # Timing accumulators: seconds spent in each section per log_every window
-    timings = defaultdict(float)
+    timings  = defaultdict(float)
+    blend_acc = 0.0   # accumulated risk_blend for logging
     bc_done = step_count >= learning_starts  # skip BC when resuming past warmup
     # Skip critic warmup when resuming past learning_starts — it already ran.
     critic_grad_steps = critic_warmup_steps if bc_done else 0
@@ -138,17 +156,44 @@ def main():
             timings['preprocess'] += time.perf_counter() - t0
 
             t0 = time.perf_counter()
+            # Controller action is always computed: it is the navigation baseline
+            # during warmup and the blending reference during RL training.
+            ctrl = session.env._compute_controller_action()
+            ctrl_action_np = _encode_controller_action(*ctrl)
+
             if step_count < learning_starts:
-                # Run waypoint controller as expert; encode to tanh-space for buffer
-                ctrl = session.env._compute_controller_action()
-                action_np = _encode_controller_action(*ctrl)
-                action = torch.tensor(action_np, dtype=torch.float32, device=session.device)
+                # Warmup: pure controller to fill the buffer with quality demos.
+                action_np = ctrl_action_np
+                action    = torch.tensor(action_np, dtype=torch.float32, device=session.device)
             else:
                 if not bc_done:
                     _run_bc_pretraining(agent, bc_steps, bc_lr, batch_size, __file__)
                     bc_done = True
-                action, _ = agent.act(obs_tensor)
-                action_np = action.detach().cpu().numpy().squeeze(0)
+
+                # RL actor — deterministic during critic warmup to preserve BC init.
+                in_critic_warmup = critic_grad_steps < critic_warmup_steps
+                rl_action, _ = agent.act(obs_tensor, deterministic=in_critic_warmup)
+                rl_action_np  = rl_action.detach().cpu().numpy().squeeze(0)
+
+                # Risk-driven blend: controller handles waypoint following by default;
+                # RL blends in proportionally as nearby-agent risk increases.
+                # At risk_blend=0 the vehicle follows the route perfectly;
+                # at risk_blend=1 the RL has full authority to avoid the NPC.
+                risk_cfg = session.env.config['risk']
+                risk_blend = _compute_risk_blend(
+                    session.env._risk_vec,
+                    session.env.risk_module.top_k,
+                    deadzone=risk_cfg.get('blend_deadzone', 0.3),
+                    scale=risk_cfg.get('blend_scale', 3.0),
+                )
+                if session.env._at_turning_junction():
+                    risk_blend = min(risk_blend, risk_cfg.get('blend_junction_cap', 0.3))
+                action_np = np.clip(
+                    (1.0 - risk_blend) * ctrl_action_np + risk_blend * rl_action_np,
+                    -1.0, 1.0,
+                )
+                action = torch.tensor(action_np, dtype=torch.float32, device=session.device).unsqueeze(0)
+                blend_acc += risk_blend
             timings['act'] += time.perf_counter() - t0
 
             t0 = time.perf_counter()
@@ -207,10 +252,12 @@ def main():
                 session.logger.log_buffer_size(step_count, len(agent.buffer))
 
                 total_t = sum(timings.values()) or 1e-9
+                avg_blend = blend_acc / max(log_every, 1)
                 Log.info(__file__,
                     f"[Step {step_count:07d}] "
                     f"Buffer: {len(agent.buffer)} | "
                     f"Alpha: {agent.trainer.alpha:.4f} | "
+                    f"RLblend: {avg_blend:.2f} | "
                     f"step={timings['env_step']*1000/log_every:.1f}ms "
                     f"pre={timings['preprocess']*1000/log_every:.1f}ms "
                     f"act={timings['act']*1000/log_every:.1f}ms "
@@ -218,7 +265,8 @@ def main():
                     f"update={timings['update']*1000/log_every:.1f}ms "
                     f"[{', '.join(f'{k}:{v/total_t*100:.0f}%' for k, v in sorted(timings.items(), key=lambda x: -x[1]))}]"
                 )
-                timings = defaultdict(float)
+                timings   = defaultdict(float)
+                blend_acc = 0.0
 
             if step_count % save_every == 0:
                 session.save_checkpoint(agent, step_count)
